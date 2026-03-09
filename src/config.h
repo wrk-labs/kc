@@ -47,6 +47,9 @@ static const short cal_colors[] = {
 #define KEY_NEXT_MONTH 'L'
 #define KEY_TODAY       'o'
 
+#define KEY_DETAIL_UP  'u'
+#define KEY_DETAIL_DOWN 'i'
+
 #define KEY_ADD_EVENT  'a'
 #define KEY_EDIT_EVENT 'e'
 #define KEY_DEL_EVENT  'x'
@@ -57,6 +60,15 @@ static const short cal_colors[] = {
 
 #define KEY_QUIT       'q'
 
+/* Google OAuth2 credentials (desktop app — not secret per Google docs) */
+#ifndef GOOGLE_CLIENT_ID
+#define GOOGLE_CLIENT_ID \
+	"525295212764-66nfdvj5smdp0mnl24u335nmb4sv8hd6.apps.googleusercontent.com"
+#endif
+#ifndef GOOGLE_CLIENT_SECRET
+#define GOOGLE_CLIENT_SECRET "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"
+#endif
+
 /* data directory (relative to $HOME) */
 static const char *data_dir = ".kc";
 
@@ -65,7 +77,7 @@ static const char *date_fmt = "%a %b %d, %Y";
 static const char *time_fmt = "%H:%M";
 
 /* first day of week: 0=Sunday, 1=Monday */
-static const int first_dow = 1;
+static const int first_dow = 0;
 
 /* sync interval hint (seconds) — used by kai-daemon, not kc itself */
 static const int sync_interval = 300;

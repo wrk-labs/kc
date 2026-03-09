@@ -22,7 +22,7 @@ CFLAGS  += -std=c99 -pedantic -Wall -Wextra -Wno-unused-variable -Os \
 LDFLAGS += $(LIBS)
 
 SRC = src/kc.c src/ui.c src/cal.c src/ical.c src/vdir.c \
-      src/caldav.c src/sanitize.c
+      src/caldav.c src/goauth.c src/sanitize.c
 OBJ = $(SRC:.c=.o)
 BIN = kc
 

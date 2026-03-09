@@ -330,10 +330,21 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 		if (parse_vevent(vevent, path, cal_idx, &events[count]) != 0)
 			continue;
 
+		/* skip cancelled overrides (deleted recurrence instances) */
+		if (icalcomponent_get_first_property(vevent,
+		    ICAL_RECURRENCEID_PROPERTY)) {
+			if (events[count].status == STATUS_CANCELLED)
+				continue;
+			/* non-cancelled override: keep as standalone event */
+			events[count].is_recurrence = 1;
+			count++;
+			continue;
+		}
+
 		/* expand recurring events */
 		if (events[count].recur_freq != RECUR_NONE) {
 			struct event base = events[count];
-			icalproperty *rrule_prop;
+			icalproperty *rrule_prop, *exd_prop;
 			struct icalrecurrencetype rrule;
 			icalrecur_iterator *ritr;
 			struct icaltimetype dtstart, next;
@@ -344,22 +355,78 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 			int max_instances = 500;
 			int inst = 0;
 
-			/* keep the base event (first occurrence) */
-			count++;
+			/* collect EXDATE values (excluded dates) */
+			time_t exdates[256];
+			int n_exdates = 0;
+			for (exd_prop = icalcomponent_get_first_property(
+				vevent, ICAL_EXDATE_PROPERTY);
+			     exd_prop && n_exdates < 256;
+			     exd_prop = icalcomponent_get_next_property(
+				vevent, ICAL_EXDATE_PROPERTY)) {
+				struct icaltimetype exdt =
+					icalproperty_get_exdate(exd_prop);
+				if (!icaltime_is_null_time(exdt))
+					exdates[n_exdates++] =
+						icaltime_as_timet_with_zone(
+							exdt,
+							icaltimezone_get_utc_timezone());
+			}
+
+			/* also exclude dates with RECURRENCE-ID overrides
+			 * (sibling VEVENTs that replace specific instances) */
+			{
+				icalcomponent *sib;
+				for (sib = icalcomponent_get_first_component(
+					root, ICAL_VEVENT_COMPONENT);
+				     sib && n_exdates < 256;
+				     sib = icalcomponent_get_next_component(
+					root, ICAL_VEVENT_COMPONENT)) {
+					icalproperty *rid = icalcomponent_get_first_property(
+						sib, ICAL_RECURRENCEID_PROPERTY);
+					if (!rid)
+						continue;
+					struct icaltimetype ridt =
+						icalproperty_get_recurrenceid(rid);
+					if (!icaltime_is_null_time(ridt))
+						exdates[n_exdates++] =
+							icaltime_as_timet_with_zone(
+								ridt,
+								icaltimezone_get_utc_timezone());
+				}
+			}
 
 			rrule_prop = icalcomponent_get_first_property(
 				vevent, ICAL_RRULE_PROPERTY);
-			if (!rrule_prop)
+			if (!rrule_prop) {
+				count++;
 				continue;
+			}
 
 			rrule = icalproperty_get_rrule(rrule_prop);
 			dtstart = icalcomponent_get_dtstart(vevent);
 			ritr = icalrecur_iterator_new(rrule, dtstart);
-			if (!ritr)
+			if (!ritr) {
+				count++;
 				continue;
+			}
 
-			/* skip the first occurrence (already kept above) */
+			/* first occurrence */
 			next = icalrecur_iterator_next(ritr);
+			{
+				/* check if base occurrence is excluded */
+				time_t bt = base.start;
+				int excluded = 0, ei;
+				for (ei = 0; ei < n_exdates; ei++) {
+					if (bt == exdates[ei] ||
+					    (base.all_day &&
+					     bt / 86400 == exdates[ei] / 86400)) {
+						excluded = 1;
+						break;
+					}
+				}
+				if (!excluded)
+					count++; /* keep base event */
+			}
 
 			while (!icaltime_is_null_time(
 				next = icalrecur_iterator_next(ritr))
@@ -370,11 +437,23 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 				if (t > window_end)
 					break;
 				if (t >= window_start) {
-					events[count] = base;
-					events[count].start = t;
-					events[count].end = t + duration;
-					events[count].is_recurrence = 1;
-					count++;
+					/* check EXDATE exclusion */
+					int excluded = 0, ei;
+					for (ei = 0; ei < n_exdates; ei++) {
+						if (t == exdates[ei] ||
+						    (base.all_day &&
+						     t / 86400 == exdates[ei] / 86400)) {
+							excluded = 1;
+							break;
+						}
+					}
+					if (!excluded) {
+						events[count] = base;
+						events[count].start = t;
+						events[count].end = t + duration;
+						events[count].is_recurrence = 1;
+						count++;
+					}
 				}
 				inst++;
 			}

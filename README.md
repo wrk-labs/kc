@@ -38,6 +38,11 @@ kc -v           # print version
 
 Config lives in `~/.kc/config`. Calendars can be managed interactively by pressing `c` inside kc.
 
+## Known Issues / Future Work
+
+- Deleting a single occurrence of a recurring event on Google Calendar causes duplication in kc after sync
+- No support for adding or removing attendees from events
+
 ## License
 
 GPL-2.0 — see [LICENSE](LICENSE).

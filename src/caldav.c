@@ -377,6 +377,31 @@ href_filename(const char *href)
 	return p ? p + 1 : href;
 }
 
+/* URL-decode a string in-place (e.g. %40 → @) */
+static void
+url_decode(char *s)
+{
+	char *r = s, *w = s;
+	while (*r) {
+		if (*r == '%' && r[1] && r[2]) {
+			int hi = r[1], lo = r[2];
+			if (hi >= '0' && hi <= '9') hi -= '0';
+			else if (hi >= 'a' && hi <= 'f') hi = hi - 'a' + 10;
+			else if (hi >= 'A' && hi <= 'F') hi = hi - 'A' + 10;
+			else { *w++ = *r++; continue; }
+			if (lo >= '0' && lo <= '9') lo -= '0';
+			else if (lo >= 'a' && lo <= 'f') lo = lo - 'a' + 10;
+			else if (lo >= 'A' && lo <= 'F') lo = lo - 'A' + 10;
+			else { *w++ = *r++; continue; }
+			*w++ = (char)(hi * 16 + lo);
+			r += 3;
+		} else {
+			*w++ = *r++;
+		}
+	}
+	*w = '\0';
+}
+
 /* ---- logging ---- */
 
 static void
@@ -404,7 +429,7 @@ sync_log(const char *fmt, ...)
 
 static CURL *
 make_curl(const char *url, const char *user, const char *pass,
-          struct buf *response)
+          struct buf *response, int bearer)
 {
 	CURL *curl = curl_easy_init();
 
@@ -424,7 +449,7 @@ make_curl(const char *url, const char *user, const char *pass,
 	curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 #endif
 
-	if (user && user[0] && pass && pass[0]) {
+	if (!bearer && user && user[0] && pass && pass[0]) {
 		curl_easy_setopt(curl, CURLOPT_USERNAME, user);
 		curl_easy_setopt(curl, CURLOPT_PASSWORD, pass);
 		curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
@@ -433,9 +458,18 @@ make_curl(const char *url, const char *user, const char *pass,
 	return curl;
 }
 
+/* add Bearer auth header to a curl_slist */
+static struct curl_slist *
+add_bearer_header(struct curl_slist *headers, const char *token)
+{
+	char auth[2200];
+	snprintf(auth, sizeof(auth), "Authorization: Bearer %s", token);
+	return curl_slist_append(headers, auth);
+}
+
 static int
 do_propfind(const char *url, const char *user, const char *pass,
-            int depth, const char *body, struct buf *response)
+            int depth, const char *body, struct buf *response, int bearer)
 {
 	CURL *curl;
 	struct curl_slist *headers = NULL;
@@ -445,7 +479,7 @@ do_propfind(const char *url, const char *user, const char *pass,
 
 	buf_init(response);
 
-	curl = make_curl(url, user, pass, response);
+	curl = make_curl(url, user, pass, response, bearer);
 	if (!curl)
 		return -1;
 
@@ -453,6 +487,8 @@ do_propfind(const char *url, const char *user, const char *pass,
 	snprintf(depth_hdr, sizeof(depth_hdr), "Depth: %d", depth);
 	headers = curl_slist_append(headers, depth_hdr);
 	headers = curl_slist_append(headers, "Content-Type: application/xml; charset=utf-8");
+	if (bearer && pass && pass[0])
+		headers = add_bearer_header(headers, pass);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
 	if (body) {
@@ -476,20 +512,27 @@ do_propfind(const char *url, const char *user, const char *pass,
 
 static int
 do_get(const char *url, const char *user, const char *pass,
-       struct buf *response)
+       struct buf *response, int bearer)
 {
 	CURL *curl;
+	struct curl_slist *headers = NULL;
 	long http_code;
 	CURLcode res;
 
 	buf_init(response);
 
-	curl = make_curl(url, user, pass, response);
+	curl = make_curl(url, user, pass, response, bearer);
 	if (!curl)
 		return -1;
 
+	if (bearer && pass && pass[0]) {
+		headers = add_bearer_header(headers, pass);
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	}
+
 	res = curl_easy_perform(curl);
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
 
 	if (res != CURLE_OK || http_code != 200)
@@ -500,7 +543,7 @@ do_get(const char *url, const char *user, const char *pass,
 
 static int
 do_put(const char *url, const char *user, const char *pass,
-       const char *data, size_t datalen, const char *etag)
+       const char *data, size_t datalen, const char *etag, int bearer)
 {
 	CURL *curl;
 	struct curl_slist *headers = NULL;
@@ -511,7 +554,7 @@ do_put(const char *url, const char *user, const char *pass,
 
 	buf_init(&response);
 
-	curl = make_curl(url, user, pass, &response);
+	curl = make_curl(url, user, pass, &response, bearer);
 	if (!curl)
 		return -1;
 
@@ -522,7 +565,8 @@ do_put(const char *url, const char *user, const char *pass,
 		snprintf(if_match, sizeof(if_match), "If-Match: %s", etag);
 		headers = curl_slist_append(headers, if_match);
 	}
-	/* no etag = unconditional PUT (works for both create and update) */
+	if (bearer && pass && pass[0])
+		headers = add_bearer_header(headers, pass);
 
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
@@ -544,23 +588,30 @@ do_put(const char *url, const char *user, const char *pass,
 }
 
 static int
-do_delete(const char *url, const char *user, const char *pass)
+do_delete(const char *url, const char *user, const char *pass, int bearer)
 {
 	CURL *curl;
+	struct curl_slist *headers = NULL;
 	struct buf response;
 	long http_code;
 	CURLcode res;
 
 	buf_init(&response);
 
-	curl = make_curl(url, user, pass, &response);
+	curl = make_curl(url, user, pass, &response, bearer);
 	if (!curl)
 		return -1;
 
 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 
+	if (bearer && pass && pass[0]) {
+		headers = add_bearer_header(headers, pass);
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	}
+
 	res = curl_easy_perform(curl);
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
 	buf_free(&response);
 
@@ -798,7 +849,7 @@ static const char *propfind_etags =
 int
 caldav_discover(const char *base_url, const char *user, const char *pass,
                 char (*names)[MAX_NAME_LEN], char (*urls)[MAX_PATH_LEN],
-                int max_results)
+                int max_results, int bearer)
 {
 	struct buf resp;
 	char principal_href[MAX_PATH_LEN] = {0};
@@ -808,7 +859,7 @@ caldav_discover(const char *base_url, const char *user, const char *pass,
 	int count = 0;
 
 	/* step 1: get current-user-principal */
-	if (do_propfind(base_url, user, pass, 0, propfind_principal, &resp) != 0) {
+	if (do_propfind(base_url, user, pass, 0, propfind_principal, &resp, bearer) != 0) {
 		sync_log("discover: PROPFIND principal failed for %s", base_url);
 		return -1;
 	}
@@ -826,7 +877,7 @@ caldav_discover(const char *base_url, const char *user, const char *pass,
 	sync_log("discover: principal = %s", principal_url);
 
 	/* step 2: get calendar-home-set */
-	if (do_propfind(principal_url, user, pass, 0, propfind_homeset, &resp) != 0) {
+	if (do_propfind(principal_url, user, pass, 0, propfind_homeset, &resp, bearer) != 0) {
 		sync_log("discover: PROPFIND homeset failed for %s", principal_url);
 		return -1;
 	}
@@ -844,7 +895,7 @@ caldav_discover(const char *base_url, const char *user, const char *pass,
 	sync_log("discover: homeset = %s", homeset_url);
 
 	/* step 3: list calendar collections */
-	if (do_propfind(homeset_url, user, pass, 1, propfind_calendars, &resp) != 0) {
+	if (do_propfind(homeset_url, user, pass, 1, propfind_calendars, &resp, bearer) != 0) {
 		sync_log("discover: PROPFIND calendars failed for %s", homeset_url);
 		return -1;
 	}
@@ -934,7 +985,7 @@ int
 caldav_put_event(const struct calendar *cal, const char *ics_path)
 {
 	const char *home = getenv("HOME");
-	char pass[MAX_NAME_LEN] = {0};
+	char pass[2048] = {0};
 	char upload_url[MAX_PATH_LEN * 2];
 	const char *fname;
 	FILE *fp;
@@ -942,6 +993,7 @@ caldav_put_event(const struct calendar *cal, const char *ics_path)
 	long fsize;
 	size_t nread, ulen;
 	int ret;
+	int bearer = cal->oauth;
 
 	if (!home || !cal->caldav || !cal->caldav_url[0])
 		return -1;
@@ -954,8 +1006,13 @@ caldav_put_event(const struct calendar *cal, const char *ics_path)
 	if (!fname[0])
 		return -1;
 
-	if (read_secret(home, cal->name, pass, sizeof(pass)) != 0)
-		return -1;
+	if (bearer) {
+		if (goauth_get_token(home, cal->name, pass, sizeof(pass)) != 0)
+			return -1;
+	} else {
+		if (read_secret(home, cal->name, pass, sizeof(pass)) != 0)
+			return -1;
+	}
 
 	/* read local file */
 	fp = fopen(ics_path, "r");
@@ -990,7 +1047,7 @@ caldav_put_event(const struct calendar *cal, const char *ics_path)
 		snprintf(upload_url, sizeof(upload_url),
 		         "%s/%s", cal->caldav_url, fname);
 
-	ret = do_put(upload_url, cal->caldav_user, pass, data, nread, NULL);
+	ret = do_put(upload_url, cal->caldav_user, pass, data, nread, NULL, bearer);
 
 	free(data);
 	memset(pass, 0, sizeof(pass));
@@ -1005,11 +1062,12 @@ int
 caldav_delete_event(const struct calendar *cal, const char *ics_path)
 {
 	const char *home = getenv("HOME");
-	char pass[MAX_NAME_LEN] = {0};
+	char pass[2048] = {0};
 	char delete_url[MAX_PATH_LEN * 2];
 	const char *fname;
 	size_t ulen;
 	int ret;
+	int bearer = cal->oauth;
 
 	if (!home || !cal->caldav || !cal->caldav_url[0])
 		return -1;
@@ -1021,8 +1079,13 @@ caldav_delete_event(const struct calendar *cal, const char *ics_path)
 	if (!fname[0])
 		return -1;
 
-	if (read_secret(home, cal->name, pass, sizeof(pass)) != 0)
-		return -1;
+	if (bearer) {
+		if (goauth_get_token(home, cal->name, pass, sizeof(pass)) != 0)
+			return -1;
+	} else {
+		if (read_secret(home, cal->name, pass, sizeof(pass)) != 0)
+			return -1;
+	}
 
 	ulen = strlen(cal->caldav_url);
 	if (ulen > 0 && cal->caldav_url[ulen - 1] == '/')
@@ -1032,7 +1095,7 @@ caldav_delete_event(const struct calendar *cal, const char *ics_path)
 		snprintf(delete_url, sizeof(delete_url),
 		         "%s/%s", cal->caldav_url, fname);
 
-	ret = do_delete(delete_url, cal->caldav_user, pass);
+	ret = do_delete(delete_url, cal->caldav_user, pass, bearer);
 	memset(pass, 0, sizeof(pass));
 	return ret;
 }
@@ -1052,17 +1115,29 @@ caldav_sync_calendar(const struct calendar *cal)
 {
 	struct buf resp;
 	struct sync_state *old_state, *new_state;
-	char pass[MAX_NAME_LEN] = {0};
+	char pass[2048] = {0};
 	const char *home = getenv("HOME");
 	int downloads = 0, deletes = 0, uploads = 0;
+	int bearer = cal->oauth;
 
 	if (!home || !cal->caldav || !cal->caldav_url[0])
 		return -1;
 
-	/* read password */
-	if (read_secret(home, cal->name, pass, sizeof(pass)) != 0) {
-		sync_log("error: no password for calendar '%s'", cal->name);
-		return -1;
+	/* get credentials */
+	if (bearer) {
+		if (goauth_get_token(home, cal->name,
+		                     pass, sizeof(pass)) != 0) {
+			sync_log("error: OAuth token failed for '%s'",
+			         cal->name);
+			return -1;
+		}
+	} else {
+		if (read_secret(home, cal->name,
+		                pass, sizeof(pass)) != 0) {
+			sync_log("error: no password for '%s'",
+			         cal->name);
+			return -1;
+		}
 	}
 
 	/* allocate sync state on heap (too large for stack) */
@@ -1079,7 +1154,7 @@ caldav_sync_calendar(const struct calendar *cal)
 
 	/* PROPFIND depth 1 to list all events + etags */
 	if (do_propfind(cal->caldav_url, cal->caldav_user, pass,
-	                1, propfind_etags, &resp) != 0) {
+	                1, propfind_etags, &resp, bearer) != 0) {
 		sync_log("error: PROPFIND failed for '%s'", cal->name);
 		free(old_state);
 		free(new_state);
@@ -1126,9 +1201,16 @@ caldav_sync_calendar(const struct calendar *cal)
 			if (!is_ics)
 				continue;
 
-			const char *fname = href_filename(href);
-			if (!fname || !*fname)
+			const char *fname_raw = href_filename(href);
+			if (!fname_raw || !*fname_raw)
 				continue;
+
+			/* URL-decode filename (e.g. %40 → @) */
+			char fname_buf[MAX_PATH_LEN];
+			strncpy(fname_buf, fname_raw, sizeof(fname_buf) - 1);
+			fname_buf[sizeof(fname_buf) - 1] = '\0';
+			url_decode(fname_buf);
+			const char *fname = fname_buf;
 
 			/* sanitize filename — prevent path traversal */
 			if (!safe_filename(fname))
@@ -1151,7 +1233,7 @@ caldav_sync_calendar(const struct calendar *cal)
 					continue;
 				}
 
-				if (do_get(full_url, cal->caldav_user, pass, &ics_resp) == 0
+				if (do_get(full_url, cal->caldav_user, pass, &ics_resp, bearer) == 0
 				    && ics_resp.data && ics_resp.len > 0
 				    && ics_resp.len < 1024 * 1024) { /* 1MB limit */
 					FILE *fp;
@@ -1241,7 +1323,7 @@ caldav_sync_calendar(const struct calendar *cal)
 								         "%s/%s", cal->caldav_url, ent->d_name);
 
 							if (do_put(upload_url, cal->caldav_user, pass,
-							           data, nread, NULL) == 0) {
+							           data, nread, NULL, bearer) == 0) {
 								uploads++;
 							}
 							free(data);

@@ -117,6 +117,7 @@ init_colors(void)
 void
 ui_init(void)
 {
+	set_escdelay(25);
 	initscr();
 	raw();
 	noecho();
@@ -673,7 +674,7 @@ static void
 draw_status(const struct state *st)
 {
 	int w = COLS;
-	int readonly = 0;
+	int readonly = 0;   /* bit 1: subscription, bit 2: not owner */
 	int has_event = 0;
 
 	/* items in priority order (highest first) */
@@ -681,20 +682,21 @@ draw_status(const struct state *st)
 	struct hint {
 		const char *text;    /* displayed text */
 		int need_event;      /* 1 = only show when event selected */
-		int hide_readonly;   /* 1 = hide for subscription events */
+		int hide_flags;      /* bitmask: 1=hide if readonly, 2=hide if not owner */
 	};
 
 	struct hint hints[] = {
 		{ "q:quit",           0, 0 },
 		{ "a:add",            0, 0 },
-		{ "e:edit",           1, 1 },
-		{ "x:del",            1, 1 },
+		{ "e:edit",           1, 3 },  /* hide if readonly OR not owner */
+		{ "x:del",            1, 3 },
 		{ "Ctrl-R:sync",      0, 0 },
-		{ "r:rsvp",           1, 1 },
+		{ "r:rsvp",           1, 1 },  /* hide only if readonly (subscription) */
 		{ "c:cal",            0, 0 },
 		{ "hjkl:nav",         0, 0 },
 		{ "H/L:month",        0, 0 },
 		{ "Up/Dn:events",     0, 0 },
+		{ "u/i:detail",       0, 0 },
 		{ "o:today",          0, 0 },
 		{ "F5/F6:upcoming",   0, 0 },
 	};
@@ -715,7 +717,20 @@ draw_status(const struct state *st)
 			const struct event *ev = day_events[st->selected_event];
 			if (ev->cal_idx >= 0 && ev->cal_idx < st->n_calendars &&
 			    st->calendars[ev->cal_idx].subscription)
-				readonly = 1;
+				readonly |= 1;
+			/* hide edit/del if user is a non-organizer attendee */
+			if (ev->organizer_email[0] && ev->n_attendees > 0) {
+				int is_att = 0, ai;
+				const char *me = cal_email(st, ev->cal_idx);
+				for (ai = 0; ai < ev->n_attendees; ai++) {
+					if (me[0] && strcasecmp(ev->attendees[ai].email, me) == 0) {
+						is_att = 1;
+						break;
+					}
+				}
+				if (is_att && strcasecmp(me, ev->organizer_email) != 0)
+					readonly |= 2;
+			}
 		}
 	}
 
@@ -725,7 +740,7 @@ draw_status(const struct state *st)
 
 		if (hints[i].need_event && !has_event)
 			continue;
-		if (hints[i].hide_readonly && readonly)
+		if (hints[i].hide_flags & readonly)
 			continue;
 
 		/* check if it fits (with separator if not first) */
@@ -777,9 +792,29 @@ draw_wrapped(WINDOW *win, int row, int col, int max_w, int max_h,
 			if (row + rows >= max_h)
 				break;
 		}
-		mvwaddch(win, row + rows, x, *p);
-		x++;
-		p++;
+
+		/* handle UTF-8 multi-byte sequences */
+		unsigned char c = (unsigned char)*p;
+		int seqlen = 1;
+		if ((c & 0xe0) == 0xc0)      seqlen = 2;
+		else if ((c & 0xf0) == 0xe0)  seqlen = 3;
+		else if ((c & 0xf8) == 0xf0)  seqlen = 4;
+
+		if (seqlen > 1) {
+			char mb[5];
+			int i;
+			for (i = 0; i < seqlen && p[i]; i++)
+				mb[i] = p[i];
+			mb[i] = '\0';
+			mvwaddstr(win, row + rows, x, mb);
+			/* wide chars may take 2 columns; narrow ones take 1 */
+			x++;
+			p += i;
+		} else {
+			mvwaddch(win, row + rows, x, *p);
+			x++;
+			p++;
+		}
 	}
 	if (x > col)
 		rows++;
@@ -824,14 +859,20 @@ draw_detail(struct state *st)
 	 * This gives us smooth scrolling without per-line bounds checks.
 	 */
 	{
+		int has_att = ev->n_attendees > 0;
+		int right_w = has_att ? max_w / 3 : 0;
+		if (right_w > 0 && right_w < 20) right_w = 20;
+		if (right_w > max_w / 2) right_w = max_w / 2;
+		int left_w = has_att ? max_w - right_w - 1 : max_w;
+
 		int pad_h = max_h + 128; /* generous virtual height */
-		WINDOW *pad = newpad(pad_h, max_w);
+		WINDOW *pad = newpad(pad_h, left_w > 0 ? left_w : max_w);
 		int prow = 0;
 		int content_h;
 
 		/* title */
 		wattron(pad, A_BOLD | COLOR_PAIR(COL_ACCENT));
-		mvwprintw(pad, prow, 1, "%.*s", max_w - 2, ev->summary);
+		mvwprintw(pad, prow, 1, "%.*s", left_w - 2, ev->summary);
 		wattroff(pad, A_BOLD | COLOR_PAIR(COL_ACCENT));
 		prow++;
 
@@ -849,9 +890,6 @@ draw_detail(struct state *st)
 			strftime(tbuf, sizeof(tbuf), "-%H:%M", &t);
 			wprintw(pad, "%s", tbuf);
 			wattroff(pad, COLOR_PAIR(COL_DIM));
-
-			if (ev->location[0])
-				wprintw(pad, "  %.*s", max_w - 16, ev->location);
 		}
 
 		if (ev->status != STATUS_NONE) {
@@ -869,14 +907,19 @@ draw_detail(struct state *st)
 		}
 		prow++;
 
-		if (ev->all_day && ev->location[0])
-			mvwprintw(pad, prow++, 1, "%.*s", max_w - 2, ev->location);
+		/* location (own line) */
+		if (ev->location[0]) {
+			wattron(pad, COLOR_PAIR(COL_DIM));
+			mvwprintw(pad, prow, 1, "@ ");
+			wattroff(pad, COLOR_PAIR(COL_DIM));
+			prow += draw_wrapped(pad, prow, 3, left_w - 1, pad_h,
+			                     ev->location, -1);
+		}
 
 		/* recurrence */
 		if (ev->recur_freq != RECUR_NONE) {
 			wattron(pad, COLOR_PAIR(COL_DIM));
-			mvwprintw(pad, prow, 1, "↻ ");
-			wattroff(pad, COLOR_PAIR(COL_DIM));
+			mvwprintw(pad, prow, 1, "repeat: ");
 			if (ev->recur_interval > 1)
 				wprintw(pad, "every %d %s",
 				        ev->recur_interval, recur_freq_str(ev->recur_freq));
@@ -891,13 +934,9 @@ draw_detail(struct state *st)
 				strftime(rubuf, sizeof(rubuf), "%Y-%m-%d", &ru);
 				wprintw(pad, " (until %s)", rubuf);
 			}
+			wattroff(pad, COLOR_PAIR(COL_DIM));
 			prow++;
 		}
-
-		/* notes (wrapped) */
-		if (ev->description[0])
-			prow += draw_wrapped(pad, prow, 1, max_w - 1, pad_h,
-			                     ev->description, COL_DIM);
 
 		/* organizer */
 		if (ev->organizer_email[0]) {
@@ -909,58 +948,11 @@ draw_detail(struct state *st)
 			prow++;
 		}
 
-		/* RSVP status */
-		if (ev->n_attendees > 0) {
-			int ps = user_partstat(st, ev);
-			if (ps >= 0) {
-				const char *label;
-				int scol;
-				switch (ps) {
-				case PARTSTAT_ACCEPTED:    scol = COL_ACCEPTED;    label = "Accepted"; break;
-				case PARTSTAT_DECLINED:    scol = COL_DECLINED;    label = "Declined"; break;
-				case PARTSTAT_TENTATIVE:   scol = COL_TENTATIVE;   label = "Tentative"; break;
-				default:                   scol = COL_NEEDSACTION; label = "Needs action"; break;
-				}
-				wattron(pad, COLOR_PAIR(COL_DIM));
-				mvwprintw(pad, prow, 1, "rsvp ");
-				wattroff(pad, COLOR_PAIR(COL_DIM));
-				wattron(pad, COLOR_PAIR(scol) | A_BOLD);
-				wprintw(pad, "%s", label);
-				wattroff(pad, COLOR_PAIR(scol) | A_BOLD);
-				prow++;
-			}
-		}
-
-		/* attendees */
-		if (ev->n_attendees > 0) {
-			const char *user_em = cal_email(st, ev->cal_idx);
-			for (i = 0; i < ev->n_attendees; i++) {
-				const struct attendee *att = &ev->attendees[i];
-				const char *sym;
-				int scol;
-
-				switch (att->status) {
-				case PARTSTAT_ACCEPTED:    scol = COL_ACCEPTED;    sym = "✓"; break;
-				case PARTSTAT_DECLINED:    scol = COL_DECLINED;    sym = "✗"; break;
-				case PARTSTAT_TENTATIVE:   scol = COL_TENTATIVE;   sym = "?"; break;
-				case PARTSTAT_NEEDSACTION: scol = COL_NEEDSACTION; sym = "●"; break;
-				default:                   scol = COL_DIM;         sym = " "; break;
-				}
-
-				wattron(pad, COLOR_PAIR(scol));
-				mvwprintw(pad, prow, 1, "%s", sym);
-				wattroff(pad, COLOR_PAIR(scol));
-
-				wprintw(pad, " %.*s", max_w - 4,
-				        att->name[0] ? att->name : att->email);
-
-				if (user_em[0] && strcasecmp(att->email, user_em) == 0) {
-					wattron(pad, COLOR_PAIR(COL_ACCENT));
-					wprintw(pad, " (you)");
-					wattroff(pad, COLOR_PAIR(COL_ACCENT));
-				}
-				prow++;
-			}
+		/* notes (wrapped, with separator) */
+		if (ev->description[0]) {
+			prow++; /* blank line before notes */
+			prow += draw_wrapped(pad, prow, 1, left_w - 1, pad_h,
+			                     ev->description, COL_DIM);
 		}
 
 		/* clamp scroll to content */
@@ -975,10 +967,83 @@ draw_detail(struct state *st)
 		copywin(pad, win_detail,
 		        ds, 0,              /* pad source (top-left) */
 		        1, 0,               /* win dest (row 1, after separator) */
-		        max_h - 1, max_w - 1,  /* win dest (bottom-right) */
+		        max_h - 1, left_w - 1,  /* win dest (bottom-right) */
 		        0);                 /* non-destructive */
 
 		delwin(pad);
+
+		/* right panel: attendees */
+		if (has_att) {
+			int rcol = left_w;  /* column where right panel starts */
+			int arow = 1;       /* row 0 is separator */
+
+			/* vertical separator */
+			wattron(win_detail, COLOR_PAIR(COL_BORDER));
+			{
+				int sr;
+				for (sr = 1; sr < max_h; sr++)
+					mvwaddch(win_detail, sr, rcol, ACS_VLINE);
+			}
+			wattroff(win_detail, COLOR_PAIR(COL_BORDER));
+
+			rcol++; /* content starts after separator */
+
+			/* RSVP status */
+			{
+				int ps = user_partstat(st, ev);
+				if (ps >= 0) {
+					const char *label;
+					int scol;
+					switch (ps) {
+					case PARTSTAT_ACCEPTED:    scol = COL_ACCEPTED;    label = "Accepted"; break;
+					case PARTSTAT_DECLINED:    scol = COL_DECLINED;    label = "Declined"; break;
+					case PARTSTAT_TENTATIVE:   scol = COL_TENTATIVE;   label = "Tentative"; break;
+					default:                   scol = COL_NEEDSACTION; label = "Needs action"; break;
+					}
+					wattron(win_detail, COLOR_PAIR(COL_DIM));
+					mvwprintw(win_detail, arow, rcol + 1, "rsvp ");
+					wattroff(win_detail, COLOR_PAIR(COL_DIM));
+					wattron(win_detail, COLOR_PAIR(scol) | A_BOLD);
+					wprintw(win_detail, "%s", label);
+					wattroff(win_detail, COLOR_PAIR(scol) | A_BOLD);
+					arow++;
+				}
+			}
+
+			/* attendee list */
+			{
+				const char *user_em = cal_email(st, ev->cal_idx);
+				int att_w = right_w - 2; /* usable width */
+
+				for (i = 0; i < ev->n_attendees && arow < max_h; i++) {
+					const struct attendee *att = &ev->attendees[i];
+					const char *sym;
+					int scol;
+
+					switch (att->status) {
+					case PARTSTAT_ACCEPTED:    scol = COL_ACCEPTED;    sym = "+"; break;
+					case PARTSTAT_DECLINED:    scol = COL_DECLINED;    sym = "-"; break;
+					case PARTSTAT_TENTATIVE:   scol = COL_TENTATIVE;   sym = "?"; break;
+					case PARTSTAT_NEEDSACTION: scol = COL_NEEDSACTION; sym = "*"; break;
+					default:                   scol = COL_DIM;         sym = " "; break;
+					}
+
+					wattron(win_detail, COLOR_PAIR(scol));
+					mvwprintw(win_detail, arow, rcol + 1, "%s", sym);
+					wattroff(win_detail, COLOR_PAIR(scol));
+
+					wprintw(win_detail, " %.*s", att_w - 3,
+					        att->name[0] ? att->name : att->email);
+
+					if (user_em[0] && strcasecmp(att->email, user_em) == 0) {
+						wattron(win_detail, COLOR_PAIR(COL_ACCENT));
+						wprintw(win_detail, " (you)");
+						wattroff(win_detail, COLOR_PAIR(COL_ACCENT));
+					}
+					arow++;
+				}
+			}
+		}
 	}
 
 	wrefresh(win_detail);
@@ -1283,25 +1348,34 @@ form_run(WINDOW *win, struct form_field *fields, int nfields,
 							cursor_row = ml_row;
 							cursor_col = ml_x;
 						}
+						/* UTF-8 sequence length */
+						unsigned char uc = (unsigned char)*p;
+						int sq = 1;
+						if ((uc & 0xE0) == 0xC0)      sq = 2;
+						else if ((uc & 0xF0) == 0xE0)  sq = 3;
+						else if ((uc & 0xF8) == 0xF0)  sq = 4;
+
 						if (*p == '\n') {
 							ml_row++;
 							ml_x = ml_ind;
 							if (is_cur && ml_nlines < 512)
 								ml_lstarts[ml_nlines++] = pos + 1;
 							wmove(rw, ml_row, ml_x);
+							p++;
 						} else if (ml_x >= win_w - 2) {
 							ml_row++;
 							ml_x = ml_ind;
 							if (is_cur && ml_nlines < 512)
 								ml_lstarts[ml_nlines++] = pos;
 							wmove(rw, ml_row, ml_x);
-							waddch(rw, *p);
+							waddnstr(rw, p, sq);
 							ml_x++;
+							p += sq;
 						} else {
-							waddch(rw, *p);
+							waddnstr(rw, p, sq);
 							ml_x++;
+							p += sq;
 						}
-						p++;
 					}
 					/* cursor at end of text */
 					if (is_cur && (int)(p - base) == cpos) {
@@ -1326,8 +1400,19 @@ form_run(WINDOW *win, struct form_field *fields, int nfields,
 					wattroff(rw, A_BOLD);
 
 				if (is_cur) {
+					/* count display columns (not bytes) up to cpos */
+					int dc = 0, bi;
+					for (bi = 0; bi < cpos && fields[fi].buf[bi]; ) {
+						unsigned char bc = (unsigned char)fields[fi].buf[bi];
+						int bsq = 1;
+						if ((bc & 0xE0) == 0xC0)      bsq = 2;
+						else if ((bc & 0xF0) == 0xE0)  bsq = 3;
+						else if ((bc & 0xF8) == 0xF0)  bsq = 4;
+						dc++;
+						bi += bsq;
+					}
 					cursor_row = row;
-					cursor_col = col + label_len + cpos;
+					cursor_col = col + label_len + dc;
 				}
 				row++;
 			} else {
@@ -1486,13 +1571,28 @@ form_run(WINDOW *win, struct form_field *fields, int nfields,
 		}
 
 		if (ch == KEY_LEFT) {
-			if (cpos > 0) cpos--;
+			if (cpos > 0) {
+				cpos--;
+				/* skip over UTF-8 continuation bytes */
+				while (cpos > 0 &&
+				       ((unsigned char)fields[fi].buf[cpos] & 0xC0) == 0x80)
+					cpos--;
+			}
 			continue;
 		}
 
 		if (ch == KEY_RIGHT) {
 			int len = (int)strlen(fields[fi].buf);
-			if (cpos < len) cpos++;
+			if (cpos < len) {
+				/* skip full UTF-8 sequence */
+				unsigned char c = (unsigned char)fields[fi].buf[cpos];
+				int skip = 1;
+				if ((c & 0xE0) == 0xC0)      skip = 2;
+				else if ((c & 0xF0) == 0xE0)  skip = 3;
+				else if ((c & 0xF8) == 0xF0)  skip = 4;
+				cpos += skip;
+				if (cpos > len) cpos = len;
+			}
 			continue;
 		}
 
@@ -1568,10 +1668,15 @@ form_run(WINDOW *win, struct form_field *fields, int nfields,
 		if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
 			if (cpos > 0) {
 				int len = (int)strlen(fields[fi].buf);
-				memmove(&fields[fi].buf[cpos - 1],
+				/* find start of UTF-8 sequence before cursor */
+				int del = 1;
+				while (del < cpos &&
+				       ((unsigned char)fields[fi].buf[cpos - del] & 0xC0) == 0x80)
+					del++;
+				memmove(&fields[fi].buf[cpos - del],
 				        &fields[fi].buf[cpos],
 				        len - cpos + 1);
-				cpos--;
+				cpos -= del;
 			}
 			continue;
 		}
@@ -1600,6 +1705,47 @@ form_run(WINDOW *win, struct form_field *fields, int nfields,
 			        len - cpos + 1);
 			fields[fi].buf[cpos] = (char)ch;
 			cpos++;
+		}
+
+		/* UTF-8 multi-byte input */
+		if (ch >= 0xC0 && ch <= 0xF7) {
+			unsigned char lead = (unsigned char)ch;
+			int seqlen = 0;
+			char mb[5];
+			int bi;
+
+			if ((lead & 0xE0) == 0xC0)      seqlen = 2;
+			else if ((lead & 0xF0) == 0xE0)  seqlen = 3;
+			else if ((lead & 0xF8) == 0xF0)  seqlen = 4;
+
+			if (seqlen > 0) {
+				int len = (int)strlen(fields[fi].buf);
+				if (len + seqlen >= fields[fi].maxlen) {
+					/* discard continuation bytes */
+					for (bi = 1; bi < seqlen; bi++)
+						wgetch(win);
+					continue;
+				}
+
+				mb[0] = (char)lead;
+				int valid = 1;
+				for (bi = 1; bi < seqlen; bi++) {
+					int cb = wgetch(win);
+					if ((cb & 0xC0) != 0x80) {
+						valid = 0;
+						break;
+					}
+					mb[bi] = (char)cb;
+				}
+				if (!valid)
+					continue;
+
+				memmove(&fields[fi].buf[cpos + seqlen],
+				        &fields[fi].buf[cpos],
+				        len - cpos + 1);
+				memcpy(&fields[fi].buf[cpos], mb, seqlen);
+				cpos += seqlen;
+			}
 		}
 	}
 }
@@ -1936,6 +2082,7 @@ ui_input(struct state *st)
 
 	/* --- detail panel scroll --- */
 	case KEY_PPAGE:  /* Page Up */
+	case KEY_DETAIL_UP:
 		if (st->detail_scroll > 0) {
 			st->detail_scroll -= 3;
 			if (st->detail_scroll < 0)
@@ -1944,6 +2091,7 @@ ui_input(struct state *st)
 		break;
 
 	case KEY_NPAGE:  /* Page Down */
+	case KEY_DETAIL_DOWN:
 		st->detail_scroll += 3;
 		break;
 
@@ -2087,6 +2235,19 @@ add_event_done:
 			if (sel_ev->cal_idx >= 0 && sel_ev->cal_idx < st->n_calendars &&
 			    st->calendars[sel_ev->cal_idx].subscription)
 				break;
+			/* block editing if user is a non-organizer attendee */
+			if (sel_ev->organizer_email[0] && sel_ev->n_attendees > 0) {
+				int is_attendee = 0, ai;
+				const char *me = cal_email(st, sel_ev->cal_idx);
+				for (ai = 0; ai < sel_ev->n_attendees; ai++) {
+					if (me[0] && strcasecmp(sel_ev->attendees[ai].email, me) == 0) {
+						is_attendee = 1;
+						break;
+					}
+				}
+				if (is_attendee && strcasecmp(me, sel_ev->organizer_email) != 0)
+					break;
+			}
 			/* find mutable copy */
 			int idx;
 			for (idx = 0; idx < st->n_events; idx++) {
@@ -2117,6 +2278,19 @@ add_event_done:
 			if (sel_ev->cal_idx >= 0 && sel_ev->cal_idx < st->n_calendars &&
 			    st->calendars[sel_ev->cal_idx].subscription)
 				break;
+			/* block deleting if user is a non-organizer attendee */
+			if (sel_ev->organizer_email[0] && sel_ev->n_attendees > 0) {
+				int is_attendee = 0, ai;
+				const char *me = cal_email(st, sel_ev->cal_idx);
+				for (ai = 0; ai < sel_ev->n_attendees; ai++) {
+					if (me[0] && strcasecmp(sel_ev->attendees[ai].email, me) == 0) {
+						is_attendee = 1;
+						break;
+					}
+				}
+				if (is_attendee && strcasecmp(me, sel_ev->organizer_email) != 0)
+					break;
+			}
 			if (ui_confirm("Delete this event?")) {
 				if (ical_delete_event(sel_ev) == 0) {
 					st->need_reload = 1;
@@ -2668,7 +2842,7 @@ ui_calendar_manager(struct state *st, const char *home)
 				/* CalDAV */
 				char url_buf[MAX_PATH_LEN] = {0};
 				char user_buf[MAX_NAME_LEN] = {0};
-				char pass_buf[MAX_NAME_LEN] = {0};
+				char pass_buf[2048] = {0};
 				int prov_ch;
 
 				/* provider selection */
@@ -2701,6 +2875,12 @@ ui_calendar_manager(struct state *st, const char *home)
 					wattroff(win_detail, COLOR_PAIR(COL_DIM));
 
 					wattron(win_detail, COLOR_PAIR(COL_ACCENT));
+					mvwprintw(win_detail, drow, 3, "g");
+					wattroff(win_detail, COLOR_PAIR(COL_ACCENT));
+					wprintw(win_detail, "  Google");
+					drow++;
+
+					wattron(win_detail, COLOR_PAIR(COL_ACCENT));
 					mvwprintw(win_detail, drow, 3, "i");
 					wattroff(win_detail, COLOR_PAIR(COL_ACCENT));
 					wprintw(win_detail, "  iCloud");
@@ -2718,7 +2898,8 @@ ui_calendar_manager(struct state *st, const char *home)
 				wtimeout(win_detail, -1);
 				for (;;) {
 					prov_ch = wgetch(win_detail);
-					if (prov_ch == 'i' || prov_ch == 'I' ||
+					if (prov_ch == 'g' || prov_ch == 'G' ||
+					    prov_ch == 'i' || prov_ch == 'I' ||
 					    prov_ch == 'c' || prov_ch == 'C' ||
 					    prov_ch == 27)
 						break;
@@ -2727,10 +2908,113 @@ ui_calendar_manager(struct state *st, const char *home)
 				if (prov_ch == 27)
 					break;
 
-				if (prov_ch == 'i' || prov_ch == 'I') {
-					char hint_buf[64];
-					strcpy(hint_buf,
-					       "Generate at appleid.apple.com > App-Specific Passwords");
+				{
+				int is_oauth = 0;
+
+				if (prov_ch == 'g' || prov_ch == 'G') {
+					/* Google OAuth2 */
+					char gid[512] = {0};
+					char gsecret[512] = {0};
+
+					if (goauth_load_client(home, gid,
+					    sizeof(gid), gsecret,
+					    sizeof(gsecret)) != 0) {
+						/* need to configure OAuth client */
+						char id_buf[512] = {0};
+						char secret_buf[512] = {0};
+
+						anf = 0;
+						afields[anf].label = "Client ID: ";
+						afields[anf].buf = id_buf;
+						afields[anf].maxlen = sizeof(id_buf);
+						afields[anf].readonly = 0;
+						afields[anf].password = 0;
+						afields[anf].required = 1;
+						afields[anf].multiline = 0;
+						afields[anf].validate = NULL;
+						anf++;
+						afields[anf].label = "Client Secret: ";
+						afields[anf].buf = secret_buf;
+						afields[anf].maxlen = sizeof(secret_buf);
+						afields[anf].readonly = 0;
+						afields[anf].password = 1;
+						afields[anf].required = 1;
+						afields[anf].multiline = 0;
+						afields[anf].validate = NULL;
+						anf++;
+
+						if (form_run(win_detail, afields,
+						             anf, 0, 1,
+						             "Google OAuth Setup") != 0)
+							break;
+
+						goauth_save_client(home,
+						    id_buf, secret_buf);
+						strncpy(gid, id_buf, sizeof(gid) - 1);
+						strncpy(gsecret, secret_buf,
+						        sizeof(gsecret) - 1);
+						memset(id_buf, 0, sizeof(id_buf));
+						memset(secret_buf, 0,
+						       sizeof(secret_buf));
+					}
+
+					/* ask for email */
+					anf = 0;
+					afields[anf].label = "Google email: ";
+					afields[anf].buf = user_buf;
+					afields[anf].maxlen = MAX_NAME_LEN;
+					afields[anf].readonly = 0;
+					afields[anf].password = 0;
+					afields[anf].required = 1;
+					afields[anf].multiline = 0;
+					afields[anf].validate = NULL;
+					anf++;
+
+					if (form_run(win_detail, afields, anf,
+					             0, 1,
+					             "Add Google Calendar") != 0) {
+						memset(gid, 0, sizeof(gid));
+						memset(gsecret, 0, sizeof(gsecret));
+						break;
+					}
+
+					detail_msg(
+					    "Waiting for Google sign-in...");
+					doupdate();
+
+					/* run OAuth flow (opens browser) */
+					if (goauth_authorize(home, name_buf,
+					    gid, gsecret) != 0) {
+						memset(gid, 0, sizeof(gid));
+						memset(gsecret, 0, sizeof(gsecret));
+						detail_error(
+						    "Authorization failed.",
+						    "Try again or check credentials.");
+						break;
+					}
+
+					memset(gid, 0, sizeof(gid));
+					memset(gsecret, 0, sizeof(gsecret));
+
+					/* get token for discovery */
+					if (goauth_get_token(home, name_buf,
+					    pass_buf,
+					    sizeof(pass_buf)) != 0) {
+						detail_error(
+						    "Failed to get token.",
+						    "Try again.");
+						break;
+					}
+
+					snprintf(url_buf, sizeof(url_buf),
+					    "https://apidata.googleusercontent.com"
+					    "/caldav/v2/");
+					is_oauth = 1;
+
+				} else if (prov_ch == 'i' || prov_ch == 'I') {
+					char hint_buf[128];
+					snprintf(hint_buf, sizeof(hint_buf),
+					         "Generate at appleid.apple.com > App-Specific Passwords");
 
 					anf = 0;
 					afields[anf].label = "Note: ";
@@ -2817,16 +3101,24 @@ ui_calendar_manager(struct state *st, const char *home)
 					memset(disc_urls, 0, sizeof(disc_urls));
 					disc_count = caldav_discover(url_buf,
 					             user_buf, pass_buf,
-					             disc_names, disc_urls, 16);
+					             disc_names, disc_urls,
+					             16, is_oauth);
 
 					if (disc_count <= 0) {
 						detail_error(
 							"Failed to connect.",
 							"Check URL and credentials.");
 					} else if (disc_count == 1) {
-						vdir_add_caldav_calendar(home, st,
-						         name_buf, disc_urls[0],
-						         user_buf, pass_buf);
+						if (is_oauth)
+							vdir_add_oauth_calendar(
+							    home, st, name_buf,
+							    disc_urls[0],
+							    user_buf);
+						else
+							vdir_add_caldav_calendar(
+							    home, st, name_buf,
+							    disc_urls[0],
+							    user_buf, pass_buf);
 						{
 							char msg[256];
 							snprintf(msg, sizeof(msg),
@@ -2843,11 +3135,19 @@ ui_calendar_manager(struct state *st, const char *home)
 						int idx = detail_cal_picker(
 							disc_names, disc_count);
 						if (idx >= 0) {
-							vdir_add_caldav_calendar(
-								home, st,
-								name_buf,
-								disc_urls[idx],
-								user_buf, pass_buf);
+							if (is_oauth)
+								vdir_add_oauth_calendar(
+								    home, st,
+								    name_buf,
+								    disc_urls[idx],
+								    user_buf);
+							else
+								vdir_add_caldav_calendar(
+								    home, st,
+								    name_buf,
+								    disc_urls[idx],
+								    user_buf,
+								    pass_buf);
 							{
 								char msg[256];
 								snprintf(msg,
@@ -2863,6 +3163,7 @@ ui_calendar_manager(struct state *st, const char *home)
 						}
 					}
 				}
+				} /* end is_oauth scope */
 			}
 			break;
 		}
@@ -3050,7 +3351,8 @@ ui_calendar_manager(struct state *st, const char *home)
 						    url_buf[0] ? url_buf
 						              : cal->caldav_url,
 						    cal->caldav_user, disc_pass,
-						    disc_names, disc_urls, 16);
+						    disc_names, disc_urls, 16,
+						    cal->oauth);
 
 						if (disc_count > 1) {
 							int idx =

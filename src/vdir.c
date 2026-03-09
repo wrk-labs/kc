@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <time.h>
 #include <unistd.h>
@@ -150,6 +151,8 @@ vdir_load_config(const char *home, struct state *st)
 				copy_str(cal->caldav_url, p + 7, MAX_PATH_LEN);
 			} else if (strncmp(p, "caldav_user ", 12) == 0) {
 				copy_str(cal->caldav_user, p + 12, MAX_NAME_LEN);
+			} else if (strcmp(p, "oauth") == 0) {
+				cal->oauth = 1;
 			} else if (strncmp(p, "email ", 6) == 0) {
 				copy_str(cal->email, p + 6, MAX_EMAIL_LEN);
 			}
@@ -201,6 +204,8 @@ vdir_save_config(const char *home, const struct state *st)
 			fprintf(fp, "  caldav %s\n", c->caldav_url);
 			if (c->caldav_user[0])
 				fprintf(fp, "  caldav_user %s\n", c->caldav_user);
+			if (c->oauth)
+				fprintf(fp, "  oauth\n");
 		}
 		fprintf(fp, "\n");
 	}
@@ -265,12 +270,95 @@ vdir_add_caldav_calendar(const char *home, struct state *st,
 }
 
 int
+vdir_add_oauth_calendar(const char *home, struct state *st,
+                         const char *name, const char *url,
+                         const char *username)
+{
+	struct calendar *cal;
+
+	if (st->n_calendars >= MAX_CALENDARS)
+		return -1;
+
+	cal = &st->calendars[st->n_calendars];
+	memset(cal, 0, sizeof(*cal));
+	copy_str(cal->name, name, MAX_NAME_LEN);
+	sanitize_name(cal->name, MAX_NAME_LEN);
+	snprintf(cal->path, MAX_PATH_LEN,
+	         "%s/%s/calendars/%s", home, data_dir, cal->name);
+	mkdir(cal->path, 0755);
+	cal->color = cal_colors[st->n_calendars % 8];
+	cal->visible = 1;
+	cal->caldav = 1;
+	cal->oauth = 1;
+	copy_str(cal->caldav_url, url, MAX_PATH_LEN);
+	copy_str(cal->caldav_user, username, MAX_NAME_LEN);
+	st->n_calendars++;
+
+	vdir_save_config(home, st);
+	return 0;
+}
+
+int
 vdir_remove_calendar(const char *home, struct state *st, int idx)
 {
 	int i;
+	char path[MAX_PATH_LEN * 2];
 
 	if (idx < 0 || idx >= st->n_calendars)
 		return -1;
+
+	/* remove calendar data directory (ics files, sync state) */
+	if (st->calendars[idx].path[0]) {
+		DIR *dir = opendir(st->calendars[idx].path);
+		if (dir) {
+			struct dirent *ent;
+			while ((ent = readdir(dir)) != NULL) {
+				if (ent->d_name[0] == '.' &&
+				    (ent->d_name[1] == '\0' ||
+				     (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+					continue;
+				snprintf(path, sizeof(path), "%s/%s",
+				         st->calendars[idx].path, ent->d_name);
+				unlink(path);
+			}
+			closedir(dir);
+			rmdir(st->calendars[idx].path);
+		}
+	}
+
+	/* remove OAuth tokens if applicable */
+	if (st->calendars[idx].oauth)
+		goauth_remove_tokens(home, st->calendars[idx].name);
+
+	/* remove secret entry — rewrite secrets file without this calendar */
+	{
+		char sec_path[MAX_PATH_LEN];
+		char tmp_path[MAX_PATH_LEN];
+		FILE *fp, *tmp;
+		char line[2048];
+
+		snprintf(sec_path, sizeof(sec_path), "%s/.kc/secrets", home);
+		snprintf(tmp_path, sizeof(tmp_path), "%s/.kc/secrets.tmp", home);
+		fp = fopen(sec_path, "r");
+		tmp = fopen(tmp_path, "w");
+		if (fp && tmp) {
+			size_t nlen = strlen(st->calendars[idx].name);
+			while (fgets(line, sizeof(line), fp)) {
+				/* skip lines starting with this calendar name */
+				if (strncmp(line, st->calendars[idx].name, nlen) == 0 &&
+				    (line[nlen] == ' ' || line[nlen] == '\t' ||
+				     line[nlen] == '\n' || line[nlen] == '\0'))
+					continue;
+				fputs(line, tmp);
+			}
+			fclose(fp);
+			fclose(tmp);
+			rename(tmp_path, sec_path);
+		} else {
+			if (fp) fclose(fp);
+			if (tmp) fclose(tmp);
+		}
+	}
 
 	/* shift remaining calendars down */
 	for (i = idx; i < st->n_calendars - 1; i++)
@@ -358,10 +446,18 @@ vdir_update_secret(const char *home, const char *name, const char *password)
 	         home, data_dir);
 
 	fp = fopen(spath, "r");
-	tp = fopen(tpath, "w");
-	if (!tp) {
-		if (fp) fclose(fp);
-		return -1;
+	{
+		int fd = open(tpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (fd < 0) {
+			if (fp) fclose(fp);
+			return -1;
+		}
+		tp = fdopen(fd, "w");
+		if (!tp) {
+			close(fd);
+			if (fp) fclose(fp);
+			return -1;
+		}
 	}
 
 	/* copy all lines except the one matching this calendar name */
@@ -378,7 +474,6 @@ vdir_update_secret(const char *home, const char *name, const char *password)
 	fprintf(tp, "%s %s\n", name, password);
 	memset(line, 0, sizeof(line)); /* clear sensitive data */
 	fclose(tp);
-	chmod(tpath, 0600);
 	rename(tpath, spath);
 
 	return 0;
@@ -517,10 +612,18 @@ vdir_remove_secret(const char *home, const char *name)
 	if (!fp)
 		return 0; /* nothing to remove */
 
-	tp = fopen(tpath, "w");
-	if (!tp) {
-		fclose(fp);
-		return -1;
+	{
+		int fd = open(tpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (fd < 0) {
+			fclose(fp);
+			return -1;
+		}
+		tp = fdopen(fd, "w");
+		if (!tp) {
+			close(fd);
+			fclose(fp);
+			return -1;
+		}
 	}
 
 	while (fgets(line, sizeof(line), fp)) {
@@ -531,7 +634,6 @@ vdir_remove_secret(const char *home, const char *name)
 
 	fclose(fp);
 	fclose(tp);
-	chmod(tpath, 0600);
 	rename(tpath, spath);
 
 	return 0;

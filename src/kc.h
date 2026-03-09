@@ -94,6 +94,7 @@ struct calendar {
 	int caldav;                   /* 1 = CalDAV sync enabled */
 	char caldav_url[MAX_PATH_LEN];
 	char caldav_user[MAX_NAME_LEN];
+	int oauth;                    /* 1 = Google OAuth2 auth */
 	int subscription;            /* 1 = read-only .ics URL subscription */
 	char sub_url[MAX_PATH_LEN];  /* .ics subscription URL */
 	char email[MAX_EMAIL_LEN];   /* RSVP email (overrides global) */
@@ -166,6 +167,9 @@ int   vdir_add_local_calendar(const char *home, struct state *st,
 int   vdir_add_caldav_calendar(const char *home, struct state *st,
                                const char *name, const char *url,
                                const char *username, const char *password);
+int   vdir_add_oauth_calendar(const char *home, struct state *st,
+                               const char *name, const char *url,
+                               const char *username);
 int   vdir_remove_calendar(const char *home, struct state *st, int idx);
 int   vdir_update_secret(const char *home, const char *name,
                           const char *password);
@@ -180,10 +184,20 @@ int   vdir_sync_all(const struct state *st);
 int   read_secret(const char *home, const char *name, char *pass, size_t passlen);
 int   caldav_discover(const char *base_url, const char *user, const char *pass,
                       char (*names)[MAX_NAME_LEN], char (*urls)[MAX_PATH_LEN],
-                      int max_results);
+                      int max_results, int bearer);
 int   caldav_sync_calendar(const struct calendar *cal);
 int   caldav_put_event(const struct calendar *cal, const char *ics_path);
 int   caldav_delete_event(const struct calendar *cal, const char *ics_path);
+
+/* goauth.c — Google OAuth2 */
+int   goauth_get_token(const char *home, const char *cal_name,
+                        char *token, size_t tokenlen);
+int   goauth_authorize(const char *home, const char *cal_name,
+                        const char *client_id, const char *client_secret);
+int   goauth_load_client(const char *home, char *id, size_t idlen,
+                          char *secret, size_t secretlen);
+int   goauth_save_client(const char *home, const char *id, const char *secret);
+int   goauth_remove_tokens(const char *home, const char *cal_name);
 
 /* ui.c — ncurses interface */
 void  ui_init(void);
