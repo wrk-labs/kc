@@ -291,6 +291,16 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 	icalcomponent *root, *vevent;
 	int count = cur_count;
 
+	/*
+	 * Collect all VEVENT components into an array before processing.
+	 * This avoids iterator corruption: the inner RECURRENCE-ID scan
+	 * used to call icalcomponent_get_first_component() on root,
+	 * which reset the outer loop's iterator and silently dropped
+	 * remaining VEVENTs (e.g. non-cancelled overrides).
+	 */
+	icalcomponent *vevents[512];
+	int n_vevents = 0;
+
 	fp = fopen(path, "r");
 	if (!fp)
 		return cur_count;
@@ -324,149 +334,210 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 	if (!root)
 		return cur_count;
 
+	/* collect all VEVENTs into array (safe from iterator resets) */
 	for (vevent = icalcomponent_get_first_component(root, ICAL_VEVENT_COMPONENT);
-	     vevent && count < max_events;
+	     vevent && n_vevents < 512;
 	     vevent = icalcomponent_get_next_component(root, ICAL_VEVENT_COMPONENT)) {
-		if (parse_vevent(vevent, path, cal_idx, &events[count]) != 0)
-			continue;
+		vevents[n_vevents++] = vevent;
+	}
 
-		/* skip cancelled overrides (deleted recurrence instances) */
-		if (icalcomponent_get_first_property(vevent,
-		    ICAL_RECURRENCEID_PROPERTY)) {
-			if (events[count].status == STATUS_CANCELLED)
+	{
+		int vi;
+		for (vi = 0; vi < n_vevents && count < max_events; vi++) {
+			vevent = vevents[vi];
+
+			if (parse_vevent(vevent, path, cal_idx, &events[count]) != 0)
 				continue;
-			/* non-cancelled override: keep as standalone event */
-			events[count].is_recurrence = 1;
-			count++;
-			continue;
-		}
 
-		/* expand recurring events */
-		if (events[count].recur_freq != RECUR_NONE) {
-			struct event base = events[count];
-			icalproperty *rrule_prop, *exd_prop;
-			struct icalrecurrencetype rrule;
-			icalrecur_iterator *ritr;
-			struct icaltimetype dtstart, next;
-			time_t duration = base.end - base.start;
-			time_t now = time(NULL);
-			time_t window_start = now - 365 * 86400; /* 1 year ago */
-			time_t window_end = now + 365 * 86400;   /* 1 year ahead */
-			int max_instances = 500;
-			int inst = 0;
-
-			/* collect EXDATE values (excluded dates) */
-			time_t exdates[256];
-			int n_exdates = 0;
-			for (exd_prop = icalcomponent_get_first_property(
-				vevent, ICAL_EXDATE_PROPERTY);
-			     exd_prop && n_exdates < 256;
-			     exd_prop = icalcomponent_get_next_property(
-				vevent, ICAL_EXDATE_PROPERTY)) {
-				struct icaltimetype exdt =
-					icalproperty_get_exdate(exd_prop);
-				if (!icaltime_is_null_time(exdt))
-					exdates[n_exdates++] =
-						icaltime_as_timet_with_zone(
-							exdt,
-							icaltimezone_get_utc_timezone());
+			/*
+			 * Cancelled overrides (deleted recurrence instances):
+			 * keep them in the events array so cross-file
+			 * deduplication can match them against RRULE-expanded
+			 * instances from other .ics files with the same UID.
+			 * ical_remove_cancelled() strips them after all files
+			 * are loaded.
+			 */
+			if (icalcomponent_get_first_property(vevent,
+			    ICAL_RECURRENCEID_PROPERTY)) {
+				events[count].is_recurrence = 1;
+				count++;
+				continue;
 			}
 
-			/* also exclude dates with RECURRENCE-ID overrides
-			 * (sibling VEVENTs that replace specific instances) */
-			{
-				icalcomponent *sib;
-				for (sib = icalcomponent_get_first_component(
-					root, ICAL_VEVENT_COMPONENT);
-				     sib && n_exdates < 256;
-				     sib = icalcomponent_get_next_component(
-					root, ICAL_VEVENT_COMPONENT)) {
-					icalproperty *rid = icalcomponent_get_first_property(
-						sib, ICAL_RECURRENCEID_PROPERTY);
-					if (!rid)
-						continue;
-					struct icaltimetype ridt =
-						icalproperty_get_recurrenceid(rid);
-					if (!icaltime_is_null_time(ridt))
+			/* expand recurring events */
+			if (events[count].recur_freq != RECUR_NONE) {
+				struct event base = events[count];
+				icalproperty *rrule_prop, *exd_prop;
+				struct icalrecurrencetype rrule;
+				icalrecur_iterator *ritr;
+				struct icaltimetype dtstart, next;
+				time_t duration = base.end - base.start;
+				time_t now = time(NULL);
+				time_t window_start = now - 365 * 86400;
+				time_t window_end = now + 365 * 86400;
+				int max_instances = 500;
+				int inst = 0;
+
+				/* collect EXDATE values (excluded dates) */
+				time_t exdates[256];
+				int n_exdates = 0;
+				for (exd_prop = icalcomponent_get_first_property(
+					vevent, ICAL_EXDATE_PROPERTY);
+				     exd_prop && n_exdates < 256;
+				     exd_prop = icalcomponent_get_next_property(
+					vevent, ICAL_EXDATE_PROPERTY)) {
+					struct icaltimetype exdt =
+						icalproperty_get_exdate(exd_prop);
+					if (!icaltime_is_null_time(exdt))
 						exdates[n_exdates++] =
 							icaltime_as_timet_with_zone(
-								ridt,
+								exdt,
 								icaltimezone_get_utc_timezone());
 				}
-			}
 
-			rrule_prop = icalcomponent_get_first_property(
-				vevent, ICAL_RRULE_PROPERTY);
-			if (!rrule_prop) {
-				count++;
-				continue;
-			}
-
-			rrule = icalproperty_get_rrule(rrule_prop);
-			dtstart = icalcomponent_get_dtstart(vevent);
-			ritr = icalrecur_iterator_new(rrule, dtstart);
-			if (!ritr) {
-				count++;
-				continue;
-			}
-
-			/* first occurrence */
-			next = icalrecur_iterator_next(ritr);
-			{
-				/* check if base occurrence is excluded */
-				time_t bt = base.start;
-				int excluded = 0, ei;
-				for (ei = 0; ei < n_exdates; ei++) {
-					if (bt == exdates[ei] ||
-					    (base.all_day &&
-					     bt / 86400 == exdates[ei] / 86400)) {
-						excluded = 1;
-						break;
+				/* also exclude dates with RECURRENCE-ID overrides
+				 * (sibling VEVENTs within this file) */
+				{
+					int si;
+					for (si = 0; si < n_vevents && n_exdates < 256; si++) {
+						icalproperty *rid = icalcomponent_get_first_property(
+							vevents[si], ICAL_RECURRENCEID_PROPERTY);
+						if (!rid)
+							continue;
+						struct icaltimetype ridt =
+							icalproperty_get_recurrenceid(rid);
+						if (!icaltime_is_null_time(ridt))
+							exdates[n_exdates++] =
+								icaltime_as_timet_with_zone(
+									ridt,
+									icaltimezone_get_utc_timezone());
 					}
 				}
-				if (!excluded)
-					count++; /* keep base event */
-			}
 
-			while (!icaltime_is_null_time(
-				next = icalrecur_iterator_next(ritr))
-			       && count < max_events
-			       && inst < max_instances) {
-				time_t t = icaltime_as_timet_with_zone(
-					next, icaltimezone_get_utc_timezone());
-				if (t > window_end)
-					break;
-				if (t >= window_start) {
-					/* check EXDATE exclusion */
+				rrule_prop = icalcomponent_get_first_property(
+					vevent, ICAL_RRULE_PROPERTY);
+				if (!rrule_prop) {
+					count++;
+					continue;
+				}
+
+				rrule = icalproperty_get_rrule(rrule_prop);
+				dtstart = icalcomponent_get_dtstart(vevent);
+				ritr = icalrecur_iterator_new(rrule, dtstart);
+				if (!ritr) {
+					count++;
+					continue;
+				}
+
+				/* first occurrence */
+				next = icalrecur_iterator_next(ritr);
+				{
+					/* check if base occurrence is excluded */
+					time_t bt = base.start;
 					int excluded = 0, ei;
 					for (ei = 0; ei < n_exdates; ei++) {
-						if (t == exdates[ei] ||
+						if (bt == exdates[ei] ||
 						    (base.all_day &&
-						     t / 86400 == exdates[ei] / 86400)) {
+						     bt / 86400 == exdates[ei] / 86400)) {
 							excluded = 1;
 							break;
 						}
 					}
-					if (!excluded) {
-						events[count] = base;
-						events[count].start = t;
-						events[count].end = t + duration;
-						events[count].is_recurrence = 1;
-						count++;
-					}
+					if (!excluded)
+						count++; /* keep base event */
 				}
-				inst++;
+
+				while (!icaltime_is_null_time(
+					next = icalrecur_iterator_next(ritr))
+				       && count < max_events
+				       && inst < max_instances) {
+					time_t t = icaltime_as_timet_with_zone(
+						next, icaltimezone_get_utc_timezone());
+					if (t > window_end)
+						break;
+					if (t >= window_start) {
+						/* check EXDATE exclusion */
+						int excluded = 0, ei;
+						for (ei = 0; ei < n_exdates; ei++) {
+							if (t == exdates[ei] ||
+							    (base.all_day &&
+							     t / 86400 == exdates[ei] / 86400)) {
+								excluded = 1;
+								break;
+							}
+						}
+						if (!excluded) {
+							events[count] = base;
+							events[count].start = t;
+							events[count].end = t + duration;
+							events[count].is_recurrence = 1;
+							count++;
+						}
+					}
+					inst++;
+				}
+
+				icalrecur_iterator_free(ritr);
+				continue;
 			}
 
-			icalrecur_iterator_free(ritr);
-			continue;
+			count++;
 		}
-
-		count++;
 	}
 
 	icalcomponent_free(root);
 	return count;
+}
+
+/*
+ * Remove cancelled recurrence overrides and their matching
+ * RRULE-expanded instances from the events array.
+ *
+ * This handles the cross-file case: when a cancelled VEVENT
+ * (RECURRENCE-ID + STATUS:CANCELLED) is in a separate .ics file
+ * from the master RRULE event, the RRULE expansion can't exclude
+ * it at load time. This post-processing step matches them by UID
+ * and start time, removing both the cancelled marker and the
+ * duplicate expanded instance.
+ *
+ * Call after all .ics files have been loaded.
+ */
+int
+ical_remove_cancelled(struct event *events, int n)
+{
+	int i, j, out;
+
+	/* pass 1: for each cancelled override, mark matching expanded instances */
+	for (i = 0; i < n; i++) {
+		if (events[i].status != STATUS_CANCELLED || !events[i].is_recurrence)
+			continue;
+		for (j = 0; j < n; j++) {
+			if (j == i)
+				continue;
+			if (events[j].status == STATUS_CANCELLED)
+				continue;
+			if (strcmp(events[j].uid, events[i].uid) != 0)
+				continue;
+			/* match by start time (same day for all-day events) */
+			if (events[j].start == events[i].start ||
+			    (events[j].all_day &&
+			     events[j].start / 86400 == events[i].start / 86400)) {
+				events[j].status = STATUS_CANCELLED;
+			}
+		}
+	}
+
+	/* pass 2: compact — remove all cancelled events */
+	out = 0;
+	for (i = 0; i < n; i++) {
+		if (events[i].status == STATUS_CANCELLED)
+			continue;
+		if (out != i)
+			events[out] = events[i];
+		out++;
+	}
+
+	return out;
 }
 
 int

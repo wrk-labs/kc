@@ -25,6 +25,7 @@ load_events(struct state *st)
 			st->calendars[i].path, i,
 			st->events, MAX_EVENTS, st->n_events);
 	}
+	st->n_events = ical_remove_cancelled(st->events, st->n_events);
 	st->need_reload = 0;
 }
 

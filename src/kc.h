@@ -147,6 +147,7 @@ void  cal_set_today(struct tm *t);
 /* ical.c — libical integration */
 int   ical_load_file(const char *path, int cal_idx, struct event *events,
                      int max_events, int cur_count);
+int   ical_remove_cancelled(struct event *events, int n);
 int   ical_save_event(const struct event *ev);
 int   ical_delete_event(const struct event *ev);
 int   ical_set_partstat(const char *ics_path, const char *email,

@@ -1275,6 +1275,122 @@ caldav_sync_calendar(const struct calendar *cal)
 		}
 	}
 
+	/*
+	 * Remove local files whose UID already exists in a
+	 * server-tracked file with a different filename.
+	 *
+	 * This happens when kc creates an event locally (e.g.
+	 * "abc123.ics") and uploads it, but the server stores
+	 * it under a different name (e.g. "uid@google.com.ics").
+	 * The next sync downloads the server's copy, but the
+	 * original local file remains — causing duplicate events.
+	 */
+	{
+		DIR *dir = opendir(cal->path);
+		struct dirent *ent;
+		if (dir) {
+			/* collect filenames to delete (can't unlink while iterating) */
+			char to_delete[256][256];
+			int n_delete = 0;
+
+			while ((ent = readdir(dir)) != NULL && n_delete < 256) {
+				size_t len = strlen(ent->d_name);
+				if (len < 5 || strcmp(ent->d_name + len - 4, ".ics") != 0)
+					continue;
+
+				/* only check untracked local files */
+				if (state_find_by_file(new_state, ent->d_name))
+					continue;
+
+				/* extract UID from this local file */
+				char local_path[MAX_PATH_LEN * 2];
+				char local_uid[MAX_SUMMARY_LEN] = {0};
+				FILE *fp;
+
+				snprintf(local_path, sizeof(local_path),
+				         "%s/%s", cal->path, ent->d_name);
+				fp = fopen(local_path, "r");
+				if (!fp)
+					continue;
+
+				{
+					char line[1024];
+					while (fgets(line, sizeof(line), fp)) {
+						line[strcspn(line, "\r\n")] = '\0';
+						if (strncmp(line, "UID:", 4) == 0) {
+							strncpy(local_uid, line + 4,
+							        sizeof(local_uid) - 1);
+							break;
+						}
+					}
+				}
+				fclose(fp);
+
+				if (!local_uid[0])
+					continue;
+
+				/* check if any server-tracked file has the same UID */
+				int si;
+				for (si = 0; si < new_state->n; si++) {
+					char tracked_path[MAX_PATH_LEN * 2];
+					char tracked_uid[MAX_SUMMARY_LEN] = {0};
+
+					/* skip if same filename (not a duplicate) */
+					if (strcmp(new_state->entries[si].filename,
+					          ent->d_name) == 0)
+						continue;
+
+					snprintf(tracked_path, sizeof(tracked_path),
+					         "%s/%s", cal->path,
+					         new_state->entries[si].filename);
+					fp = fopen(tracked_path, "r");
+					if (!fp)
+						continue;
+
+					{
+						char line[1024];
+						while (fgets(line, sizeof(line), fp)) {
+							line[strcspn(line, "\r\n")] = '\0';
+							if (strncmp(line, "UID:", 4) == 0) {
+								strncpy(tracked_uid, line + 4,
+								        sizeof(tracked_uid) - 1);
+								break;
+							}
+						}
+					}
+					fclose(fp);
+
+					if (tracked_uid[0] &&
+					    strcmp(local_uid, tracked_uid) == 0) {
+						/* duplicate — mark for deletion */
+						strncpy(to_delete[n_delete],
+						        ent->d_name, 255);
+						to_delete[n_delete][255] = '\0';
+						n_delete++;
+						sync_log("dedup: removing '%s' "
+						         "(UID %s already in '%s')",
+						         ent->d_name, local_uid,
+						         new_state->entries[si].filename);
+						break;
+					}
+				}
+			}
+			closedir(dir);
+
+			/* delete duplicates */
+			{
+				int di;
+				for (di = 0; di < n_delete; di++) {
+					char del_path[MAX_PATH_LEN + 256 + 2];
+					snprintf(del_path, sizeof(del_path),
+					         "%s/%.255s", cal->path, to_delete[di]);
+					unlink(del_path);
+					deletes++;
+				}
+			}
+		}
+	}
+
 	/* upload new local files (not tracked in state) */
 	{
 		DIR *dir = opendir(cal->path);
