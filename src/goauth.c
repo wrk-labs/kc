@@ -302,11 +302,13 @@ token_refresh(const char *client_id, const char *client_secret,
 
 	if (res != CURLE_OK || http_code != 200 || !resp.data) {
 		free(resp.data);
+		memset(access_out, 0, alen);
 		return -1;
 	}
 
 	if (json_get_str(resp.data, "access_token", access_out, alen) != 0) {
 		free(resp.data);
+		memset(access_out, 0, alen);
 		return -1;
 	}
 
@@ -359,11 +361,38 @@ goauth_get_token(const char *home, const char *cal_name,
 	long expires_in = 0;
 	if (token_refresh(client_id, client_secret, refresh,
 	                  access, sizeof(access), &expires_in) != 0) {
+		/* refresh failed — token likely revoked, re-authorize */
+		fprintf(stderr, "kc: OAuth token expired for '%s', "
+		        "opening browser to re-authorize...\n", cal_name);
+
+		if (goauth_authorize(home, cal_name,
+		                     client_id, client_secret) != 0) {
+			fprintf(stderr, "kc: re-authorization failed for '%s'\n",
+			        cal_name);
+			memset(access, 0, sizeof(access));
+			memset(refresh, 0, sizeof(refresh));
+			memset(client_id, 0, sizeof(client_id));
+			memset(client_secret, 0, sizeof(client_secret));
+			return -1;
+		}
+
+		/* reload the freshly saved tokens */
+		memset(access, 0, sizeof(access));
+		memset(refresh, 0, sizeof(refresh));
+		if (tokens_load(home, cal_name, access, sizeof(access),
+		                refresh, sizeof(refresh), &expires_at) != 0) {
+			memset(client_id, 0, sizeof(client_id));
+			memset(client_secret, 0, sizeof(client_secret));
+			return -1;
+		}
+
+		strncpy(token, access, tokenlen - 1);
+		token[tokenlen - 1] = '\0';
 		memset(access, 0, sizeof(access));
 		memset(refresh, 0, sizeof(refresh));
 		memset(client_id, 0, sizeof(client_id));
 		memset(client_secret, 0, sizeof(client_secret));
-		return -1;
+		return 0;
 	}
 
 	tokens_save(home, cal_name, access, refresh,

@@ -135,8 +135,8 @@ vdir_load_config(const char *home, struct state *st)
 
 			if (strncmp(p, "path ", 5) == 0) {
 				copy_str(cal->path, p + 5, MAX_PATH_LEN);
-				/* reject paths containing ".." to prevent traversal */
-				if (strstr(cal->path, "..")) {
+				/* reject absolute paths and ".." to prevent traversal */
+				if (strstr(cal->path, "..") || cal->path[0] == '/') {
 					snprintf(cal->path, MAX_PATH_LEN,
 					         "%s/%s/calendars/%s", home, data_dir, cal->name);
 				}
@@ -309,20 +309,28 @@ vdir_remove_calendar(const char *home, struct state *st, int idx)
 
 	/* remove calendar data directory (ics files, sync state) */
 	if (st->calendars[idx].path[0]) {
-		DIR *dir = opendir(st->calendars[idx].path);
-		if (dir) {
-			struct dirent *ent;
-			while ((ent = readdir(dir)) != NULL) {
-				if (ent->d_name[0] == '.' &&
-				    (ent->d_name[1] == '\0' ||
-				     (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-					continue;
-				snprintf(path, sizeof(path), "%s/%s",
-				         st->calendars[idx].path, ent->d_name);
-				unlink(path);
+		struct stat sb;
+		/* refuse to follow symlinks */
+		if (lstat(st->calendars[idx].path, &sb) == 0 &&
+		    S_ISDIR(sb.st_mode) && !S_ISLNK(sb.st_mode)) {
+			DIR *dir = opendir(st->calendars[idx].path);
+			if (dir) {
+				struct dirent *ent;
+				while ((ent = readdir(dir)) != NULL) {
+					if (ent->d_name[0] == '.' &&
+					    (ent->d_name[1] == '\0' ||
+					     (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+						continue;
+					snprintf(path, sizeof(path), "%s/%s",
+					         st->calendars[idx].path, ent->d_name);
+					/* skip symlinks inside the directory too */
+					if (lstat(path, &sb) == 0 && S_ISLNK(sb.st_mode))
+						continue;
+					unlink(path);
+				}
+				closedir(dir);
+				rmdir(st->calendars[idx].path);
 			}
-			closedir(dir);
-			rmdir(st->calendars[idx].path);
 		}
 	}
 
@@ -632,6 +640,7 @@ vdir_remove_secret(const char *home, const char *name)
 		fputs(line, tp);
 	}
 
+	memset(line, 0, sizeof(line));
 	fclose(fp);
 	fclose(tp);
 	rename(tpath, spath);

@@ -702,6 +702,196 @@ bump_sequence(icalcomponent *vevent)
 	}
 }
 
+int
+ical_add_attendee(const char *ics_path, const char *email, const char *name)
+{
+	FILE *fp;
+	long len;
+	char *buf;
+	icalcomponent *root, *vevent;
+	icalproperty *prop;
+	const char *val;
+	char mailto[MAX_EMAIL_LEN + 8];
+
+	/* read file */
+	fp = fopen(ics_path, "r");
+	if (!fp)
+		return -1;
+
+	fseek(fp, 0, SEEK_END);
+	len = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	if (len <= 0 || len > 1024 * 1024) {
+		fclose(fp);
+		return -1;
+	}
+
+	buf = malloc(len + 1);
+	if (!buf) {
+		fclose(fp);
+		return -1;
+	}
+
+	if ((long)fread(buf, 1, len, fp) != len) {
+		free(buf);
+		fclose(fp);
+		return -1;
+	}
+	buf[len] = '\0';
+	fclose(fp);
+
+	root = icalparser_parse_string(buf);
+	free(buf);
+
+	if (!root)
+		return -1;
+
+	vevent = icalcomponent_get_first_component(root, ICAL_VEVENT_COMPONENT);
+	if (!vevent) {
+		icalcomponent_free(root);
+		return -1;
+	}
+
+	/* check for duplicate */
+	for (prop = icalcomponent_get_first_property(vevent, ICAL_ATTENDEE_PROPERTY);
+	     prop;
+	     prop = icalcomponent_get_next_property(vevent, ICAL_ATTENDEE_PROPERTY)) {
+		val = icalproperty_get_attendee(prop);
+		if (val) {
+			if (strncasecmp(val, "mailto:", 7) == 0)
+				val += 7;
+			if (strcasecmp(val, email) == 0) {
+				icalcomponent_free(root);
+				return -1;
+			}
+		}
+	}
+
+	/* validate email length */
+	if (strlen(email) >= MAX_EMAIL_LEN) {
+		icalcomponent_free(root);
+		return -1;
+	}
+
+	/* create ATTENDEE property */
+	snprintf(mailto, sizeof(mailto), "mailto:%s", email);
+	prop = icalproperty_new_attendee(mailto);
+	icalproperty_add_parameter(prop,
+		icalparameter_new_partstat(ICAL_PARTSTAT_NEEDSACTION));
+	icalproperty_add_parameter(prop,
+		icalparameter_new_rsvp(ICAL_RSVP_TRUE));
+	if (name && name[0])
+		icalproperty_add_parameter(prop, icalparameter_new_cn(name));
+	icalcomponent_add_property(vevent, prop);
+
+	update_timestamps(vevent);
+	bump_sequence(vevent);
+
+	/* write back */
+	fp = fopen(ics_path, "w");
+	if (!fp) {
+		icalcomponent_free(root);
+		return -1;
+	}
+
+	fprintf(fp, "%s", icalcomponent_as_ical_string(root));
+	fclose(fp);
+	icalcomponent_free(root);
+
+	return 0;
+}
+
+int
+ical_remove_attendee(const char *ics_path, const char *email)
+{
+	FILE *fp;
+	long len;
+	char *buf;
+	icalcomponent *root, *vevent;
+	icalproperty *prop;
+	const char *val;
+	int found = 0;
+
+	/* read file */
+	fp = fopen(ics_path, "r");
+	if (!fp)
+		return -1;
+
+	fseek(fp, 0, SEEK_END);
+	len = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	if (len <= 0 || len > 1024 * 1024) {
+		fclose(fp);
+		return -1;
+	}
+
+	buf = malloc(len + 1);
+	if (!buf) {
+		fclose(fp);
+		return -1;
+	}
+
+	if ((long)fread(buf, 1, len, fp) != len) {
+		free(buf);
+		fclose(fp);
+		return -1;
+	}
+	buf[len] = '\0';
+	fclose(fp);
+
+	root = icalparser_parse_string(buf);
+	free(buf);
+
+	if (!root)
+		return -1;
+
+	vevent = icalcomponent_get_first_component(root, ICAL_VEVENT_COMPONENT);
+	if (!vevent) {
+		icalcomponent_free(root);
+		return -1;
+	}
+
+	/* find and remove matching attendee */
+	for (prop = icalcomponent_get_first_property(vevent, ICAL_ATTENDEE_PROPERTY);
+	     prop;
+	     prop = icalcomponent_get_next_property(vevent, ICAL_ATTENDEE_PROPERTY)) {
+		val = icalproperty_get_attendee(prop);
+		if (!val)
+			continue;
+		if (strncasecmp(val, "mailto:", 7) == 0)
+			val += 7;
+		if (strcasecmp(val, email) == 0) {
+			icalcomponent_remove_property(vevent, prop);
+			icalproperty_free(prop);
+			found = 1;
+			break;
+		}
+	}
+
+	if (!found) {
+		icalcomponent_free(root);
+		return -1;
+	}
+
+	update_timestamps(vevent);
+	bump_sequence(vevent);
+
+	/* write back */
+	fp = fopen(ics_path, "w");
+	if (!fp) {
+		icalcomponent_free(root);
+		return -1;
+	}
+
+	fprintf(fp, "%s", icalcomponent_as_ical_string(root));
+	fclose(fp);
+	icalcomponent_free(root);
+
+	return 0;
+}
+
 /* save event — parse-modify-writeback for existing files, from-scratch for new */
 int
 ical_save_event(const struct event *ev)

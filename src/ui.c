@@ -90,6 +90,16 @@ init_colors(void)
 		init_pair(37, KAI_RED,      -1);   /* cal 6 */
 		init_pair(38, KAI_WHITE,    -1);   /* cal 7 */
 		init_pair(39, KAI_BRIGHTWHITE, -1);/* cal 8 */
+
+		/* selected-row calendar dot pairs (offset by 40) */
+		init_pair(40, KAI_ORANGE,   KAI_ORANGE);  /* cal 1 */
+		init_pair(41, KAI_BLUE,     KAI_ORANGE);  /* cal 2 */
+		init_pair(42, KAI_MAGENTA,  KAI_ORANGE);  /* cal 3 */
+		init_pair(43, KAI_GREEN,    KAI_ORANGE);  /* cal 4 */
+		init_pair(44, KAI_CYAN,     KAI_ORANGE);  /* cal 5 */
+		init_pair(45, KAI_RED,      KAI_ORANGE);  /* cal 6 */
+		init_pair(46, KAI_WHITE,    KAI_ORANGE);  /* cal 7 */
+		init_pair(47, KAI_BRIGHTWHITE, KAI_ORANGE);/* cal 8 */
 	} else {
 		/* fallback for terminals that can't redefine colors */
 		init_pair(COL_FG,          COLOR_WHITE,   -1);
@@ -111,6 +121,16 @@ init_colors(void)
 		init_pair(37, COLOR_RED,     -1);
 		init_pair(38, COLOR_WHITE,   -1);
 		init_pair(39, COLOR_YELLOW,  -1);
+
+		/* selected-row calendar dot pairs (offset by 40) */
+		init_pair(40, COLOR_YELLOW,  COLOR_YELLOW);
+		init_pair(41, COLOR_BLUE,    COLOR_YELLOW);
+		init_pair(42, COLOR_MAGENTA, COLOR_YELLOW);
+		init_pair(43, COLOR_GREEN,   COLOR_YELLOW);
+		init_pair(44, COLOR_CYAN,    COLOR_YELLOW);
+		init_pair(45, COLOR_RED,     COLOR_YELLOW);
+		init_pair(46, COLOR_WHITE,   COLOR_YELLOW);
+		init_pair(47, COLOR_YELLOW,  COLOR_YELLOW);
 	}
 }
 
@@ -457,7 +477,8 @@ draw_month_cal(const struct state *st)
 				if (urow >= cal_h) break;
 
 				/* time + summary on one line */
-				cpair = 32 + ev->cal_idx;
+				cpair = 32 + ((ev->cal_idx >= 0 && ev->cal_idx < MAX_CALENDARS)
+				              ? ev->cal_idx : 0);
 				if (!ev->all_day) {
 					strftime(time_buf, sizeof(time_buf), "%H:%M", &et);
 					wattron(win_cal, COLOR_PAIR(COL_DIM));
@@ -579,7 +600,9 @@ draw_events(const struct state *st)
 		int selected = (i == st->selected_event);
 		if (y >= max_h - 1)
 			break;
-		int cpair = 32 + ev->cal_idx;
+		int safe_idx = (ev->cal_idx >= 0 && ev->cal_idx < MAX_CALENDARS)
+		               ? ev->cal_idx : 0;
+		int cpair = 32 + safe_idx;
 		int ps = user_partstat(st, ev);
 		int summary_end;
 
@@ -588,12 +611,20 @@ draw_events(const struct state *st)
 			mvwhline(win_events, y, 0, ' ', max_w);
 		}
 
-		/* calendar color indicator */
-		if (!selected)
+		/* calendar color indicator — always show calendar color */
+		if (selected) {
+			wattroff(win_events, COLOR_PAIR(COL_SELECTED) | A_BOLD);
+			wattron(win_events, COLOR_PAIR(40 + safe_idx));
+		} else {
 			wattron(win_events, COLOR_PAIR(cpair));
+		}
 		mvwprintw(win_events, y, 1, "●");
-		if (!selected)
+		if (selected) {
+			wattroff(win_events, COLOR_PAIR(40 + safe_idx));
+			wattron(win_events, COLOR_PAIR(COL_SELECTED) | A_BOLD);
+		} else {
 			wattroff(win_events, COLOR_PAIR(cpair));
+		}
 
 		/* time */
 		if (ev->all_day) {
@@ -690,6 +721,8 @@ draw_status(const struct state *st)
 		{ "a:add",            0, 0 },
 		{ "e:edit",           1, 3 },  /* hide if readonly OR not owner */
 		{ "x:del",            1, 3 },
+		{ "+:att+",           1, 3 },  /* hide if readonly OR not owner */
+		{ "-:att-",           1, 3 },
 		{ "Ctrl-R:sync",      0, 0 },
 		{ "r:rsvp",           1, 1 },  /* hide only if readonly (subscription) */
 		{ "c:cal",            0, 0 },
@@ -748,11 +781,14 @@ draw_status(const struct state *st)
 		if (bar_len + needed > w - 2)
 			continue;
 
+		if (bar_len + needed >= (int)sizeof(bar))
+			continue;
+
 		if (bar_len > 0) {
-			strcat(bar, sep);
+			strncat(bar, sep, sizeof(bar) - bar_len - 1);
 			bar_len += sep_len;
 		}
-		strcat(bar, hints[i].text);
+		strncat(bar, hints[i].text, sizeof(bar) - bar_len - 1);
 		bar_len += tlen;
 	}
 
@@ -2053,6 +2089,9 @@ ui_event_editor(struct state *st, struct event *ev, int is_new)
 	return 0;
 }
 
+/* forward declaration — defined after calendar manager */
+static int detail_attendee_picker(const struct event *ev);
+
 int
 ui_input(struct state *st)
 {
@@ -2374,6 +2413,108 @@ add_event_done:
 		}
 		break;
 
+	case KEY_ADD_ATTENDEE: {
+		n_day = get_day_events(st, day_events, 256);
+		if (n_day > 0 && st->selected_event >= 0 && st->selected_event < n_day) {
+			const struct event *sel_ev = day_events[st->selected_event];
+			/* block on subscriptions */
+			if (sel_ev->cal_idx >= 0 && sel_ev->cal_idx < st->n_calendars &&
+			    st->calendars[sel_ev->cal_idx].subscription)
+				break;
+			/* block if user is a non-organizer attendee */
+			if (sel_ev->organizer_email[0] && sel_ev->n_attendees > 0) {
+				int is_att = 0, ai;
+				const char *me = cal_email(st, sel_ev->cal_idx);
+				for (ai = 0; ai < sel_ev->n_attendees; ai++) {
+					if (me[0] && strcasecmp(sel_ev->attendees[ai].email, me) == 0) {
+						is_att = 1;
+						break;
+					}
+				}
+				if (is_att && strcasecmp(me, sel_ev->organizer_email) != 0)
+					break;
+			}
+			if (sel_ev->n_attendees >= MAX_ATTENDEES)
+				break;
+
+			{
+				char email_buf[MAX_EMAIL_LEN] = {0};
+				char name_buf[MAX_NAME_LEN] = {0};
+				struct form_field afields[2];
+				int anf = 0;
+
+				memset(afields, 0, sizeof(afields));
+
+				afields[anf].label = "Email: ";
+				afields[anf].buf = email_buf;
+				afields[anf].maxlen = MAX_EMAIL_LEN;
+				afields[anf].required = 1;
+				anf++;
+
+				afields[anf].label = "Name: ";
+				afields[anf].buf = name_buf;
+				afields[anf].maxlen = MAX_NAME_LEN;
+				anf++;
+
+				if (form_run(win_detail, afields, anf, 0, 1,
+				             "Add Attendee") == 0) {
+					if (ical_add_attendee(sel_ev->ics_path,
+					                      email_buf, name_buf) == 0) {
+						st->need_reload = 1;
+						int ci = sel_ev->cal_idx;
+						if (ci >= 0 && ci < st->n_calendars &&
+						    st->calendars[ci].caldav)
+							caldav_put_event(&st->calendars[ci],
+							                 sel_ev->ics_path);
+					}
+				}
+			}
+		}
+		break;
+	}
+
+	case KEY_DEL_ATTENDEE: {
+		n_day = get_day_events(st, day_events, 256);
+		if (n_day > 0 && st->selected_event >= 0 && st->selected_event < n_day) {
+			const struct event *sel_ev = day_events[st->selected_event];
+			/* block on subscriptions */
+			if (sel_ev->cal_idx >= 0 && sel_ev->cal_idx < st->n_calendars &&
+			    st->calendars[sel_ev->cal_idx].subscription)
+				break;
+			/* block if user is a non-organizer attendee */
+			if (sel_ev->organizer_email[0] && sel_ev->n_attendees > 0) {
+				int is_att = 0, ai;
+				const char *me = cal_email(st, sel_ev->cal_idx);
+				for (ai = 0; ai < sel_ev->n_attendees; ai++) {
+					if (me[0] && strcasecmp(sel_ev->attendees[ai].email, me) == 0) {
+						is_att = 1;
+						break;
+					}
+				}
+				if (is_att && strcasecmp(me, sel_ev->organizer_email) != 0)
+					break;
+			}
+			if (sel_ev->n_attendees == 0)
+				break;
+
+			{
+				int pick = detail_attendee_picker(sel_ev);
+				if (pick >= 0 && ui_confirm("Remove this attendee?")) {
+					if (ical_remove_attendee(sel_ev->ics_path,
+					    sel_ev->attendees[pick].email) == 0) {
+						st->need_reload = 1;
+						int ci = sel_ev->cal_idx;
+						if (ci >= 0 && ci < st->n_calendars &&
+						    st->calendars[ci].caldav)
+							caldav_put_event(&st->calendars[ci],
+							                 sel_ev->ics_path);
+					}
+				}
+			}
+		}
+		break;
+	}
+
 	case KEY_CAL_MGR:
 		if (ui_calendar_manager(st, getenv("HOME")) > 0)
 			st->need_reload = 1;
@@ -2558,6 +2699,50 @@ detail_cal_picker(char (*names)[MAX_NAME_LEN], int count)
 		if (pick_ch == 27) return -1;
 		if (pick_ch >= '1' && pick_ch <= '9' &&
 		    (pick_ch - '1') < count)
+			return pick_ch - '1';
+	}
+}
+
+/* Attendee picker in win_detail.
+ * Returns picked index (0-based), or -1 on cancel. */
+static int
+detail_attendee_picker(const struct event *ev)
+{
+	int max_w = getmaxx(win_detail);
+	int row = 0;
+	int i, pick_ch;
+
+	werase(win_detail);
+	wattron(win_detail, COLOR_PAIR(COL_BORDER));
+	mvwhline(win_detail, 0, 0, ACS_HLINE, max_w);
+	wattroff(win_detail, COLOR_PAIR(COL_BORDER));
+	row = 1;
+
+	wattron(win_detail, A_BOLD | COLOR_PAIR(COL_ACCENT));
+	mvwprintw(win_detail, row++, 1, "Remove Attendee");
+	wattroff(win_detail, A_BOLD | COLOR_PAIR(COL_ACCENT));
+	row++;
+
+	for (i = 0; i < ev->n_attendees && i < 9; i++) {
+		wattron(win_detail, COLOR_PAIR(COL_ACCENT));
+		mvwprintw(win_detail, row, 3, "%d", i + 1);
+		wattroff(win_detail, COLOR_PAIR(COL_ACCENT));
+		wprintw(win_detail, "  %s",
+		        ev->attendees[i].name[0] ? ev->attendees[i].name
+		                                 : ev->attendees[i].email);
+		row++;
+	}
+
+	detail_menu_hint();
+	wrefresh(win_detail);
+
+	keypad(win_detail, TRUE);
+	wtimeout(win_detail, -1);
+	for (;;) {
+		pick_ch = wgetch(win_detail);
+		if (pick_ch == 27) return -1;
+		if (pick_ch >= '1' && pick_ch <= '9' &&
+		    (pick_ch - '1') < ev->n_attendees)
 			return pick_ch - '1';
 	}
 }

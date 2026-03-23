@@ -152,6 +152,9 @@ int   ical_save_event(const struct event *ev);
 int   ical_delete_event(const struct event *ev);
 int   ical_set_partstat(const char *ics_path, const char *email,
                         enum partstat status);
+int   ical_add_attendee(const char *ics_path, const char *email,
+                         const char *name);
+int   ical_remove_attendee(const char *ics_path, const char *email);
 const char *partstat_str(enum partstat s);
 const char *event_status_str(enum event_status s);
 const char *recur_freq_str(enum recur_freq f);

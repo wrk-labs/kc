@@ -54,6 +54,8 @@ static const short cal_colors[] = {
 #define KEY_EDIT_EVENT 'e'
 #define KEY_DEL_EVENT  'x'
 #define KEY_RSVP       'r'
+#define KEY_ADD_ATTENDEE  '+'
+#define KEY_DEL_ATTENDEE  '-'
 #define KEY_SYNC       18   /* Ctrl-R */
 #define KEY_TOGGLE_CAL '1'   /* 1-8 toggle calendar visibility */
 #define KEY_CAL_MGR    'c'   /* open calendar manager */

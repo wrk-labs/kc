@@ -32,10 +32,9 @@ load_events(struct state *st)
 static void
 usage(void)
 {
-	fprintf(stderr, "usage: kc [-v] [-s] [-c config]\n");
+	fprintf(stderr, "usage: kc [-v] [-s]\n");
 	fprintf(stderr, "  -v        show version\n");
 	fprintf(stderr, "  -s        sync calendars\n");
-	fprintf(stderr, "  -c path   config file path\n");
 	exit(1);
 }
 
@@ -83,6 +82,9 @@ main(int argc, char *argv[])
 	/* set today */
 	cal_today(&state.today);
 	memcpy(&state.cursor, &state.today, sizeof(struct tm));
+
+	/* sync calendars on startup */
+	vdir_sync_all(&state);
 
 	/* load events from all calendars */
 	load_events(&state);

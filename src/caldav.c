@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <curl/curl.h>
@@ -716,8 +717,11 @@ state_load(const char *cal_path, struct sync_state *ss)
 		*tab2 = '\0';
 
 		strncpy(e->filename, line, sizeof(e->filename) - 1);
+		e->filename[sizeof(e->filename) - 1] = '\0';
 		strncpy(e->etag, tab1 + 1, sizeof(e->etag) - 1);
+		e->etag[sizeof(e->etag) - 1] = '\0';
 		strncpy(e->href, tab2 + 1, sizeof(e->href) - 1);
+		e->href[sizeof(e->href) - 1] = '\0';
 		ss->n++;
 	}
 
@@ -1236,14 +1240,22 @@ caldav_sync_calendar(const struct calendar *cal)
 				if (do_get(full_url, cal->caldav_user, pass, &ics_resp, bearer) == 0
 				    && ics_resp.data && ics_resp.len > 0
 				    && ics_resp.len < 1024 * 1024) { /* 1MB limit */
-					FILE *fp;
+					int fd;
 					snprintf(local_path, sizeof(local_path),
 					         "%s/%s", cal->path, fname);
-					fp = fopen(local_path, "w");
-					if (fp) {
-						fwrite(ics_resp.data, 1, ics_resp.len, fp);
-						fclose(fp);
-						downloads++;
+					/* open with O_NOFOLLOW to reject symlinks */
+					fd = open(local_path,
+					          O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+					          0644);
+					if (fd >= 0) {
+						FILE *fp = fdopen(fd, "w");
+						if (fp) {
+							fwrite(ics_resp.data, 1, ics_resp.len, fp);
+							fclose(fp);
+							downloads++;
+						} else {
+							close(fd);
+						}
 					}
 				}
 				buf_free(&ics_resp);
@@ -1253,8 +1265,11 @@ caldav_sync_calendar(const struct calendar *cal)
 			if (new_state->n < MAX_SYNC_ENTRIES) {
 				struct sync_entry *e = &new_state->entries[new_state->n];
 				strncpy(e->filename, fname, sizeof(e->filename) - 1);
+				e->filename[sizeof(e->filename) - 1] = '\0';
 				strncpy(e->etag, etag, sizeof(e->etag) - 1);
+				e->etag[sizeof(e->etag) - 1] = '\0';
 				strncpy(e->href, href, sizeof(e->href) - 1);
+				e->href[sizeof(e->href) - 1] = '\0';
 				new_state->n++;
 			}
 		}
