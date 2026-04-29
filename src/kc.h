@@ -184,6 +184,11 @@ int   vdir_add_subscription(const char *home, struct state *st,
 int   vdir_fetch_subscription(const struct calendar *cal);
 int   vdir_sync_all(const struct state *st);
 
+/* when nonzero, sync and OAuth flows print progress to stderr.
+ * set by main() before pre-TUI sync; cleared before ncurses init so
+ * in-TUI sync paths (which have their own status bar) stay silent. */
+extern int kc_progress_verbose;
+
 /* caldav.c — native CalDAV sync */
 int   read_secret(const char *home, const char *name, char *pass, size_t passlen);
 int   caldav_discover(const char *base_url, const char *user, const char *pass,

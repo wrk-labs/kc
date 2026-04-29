@@ -66,6 +66,7 @@ main(int argc, char *argv[])
 		} else if (strcmp(argv[i], "-s") == 0) {
 			vdir_init_data_dir(home);
 			vdir_load_config(home, &state);
+			kc_progress_verbose = 1;
 			vdir_sync_all(&state);
 			return 0;
 		} else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -84,7 +85,13 @@ main(int argc, char *argv[])
 	memcpy(&state.cursor, &state.today, sizeof(struct tm));
 
 	/* sync calendars on startup */
+	if (state.n_calendars > 0)
+		fprintf(stderr, "kc: syncing %d calendar%s...\n",
+		        state.n_calendars,
+		        state.n_calendars == 1 ? "" : "s");
+	kc_progress_verbose = 1;
 	vdir_sync_all(&state);
+	kc_progress_verbose = 0;
 
 	/* load events from all calendars */
 	load_events(&state);

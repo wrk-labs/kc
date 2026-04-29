@@ -493,6 +493,14 @@ goauth_authorize(const char *home, const char *cal_name,
 	if (pid > 0)
 		waitpid(pid, NULL, WNOHANG);
 
+	if (kc_progress_verbose) {
+		fprintf(stderr,
+		    "kc: opened browser for '%s' — click Allow to continue "
+		    "(waiting up to %d seconds)...\n",
+		    cal_name, OAUTH_TIMEOUT);
+		fflush(stderr);
+	}
+
 	/* wait for redirect with timeout */
 	FD_ZERO(&fds);
 	FD_SET(srv, &fds);
@@ -643,6 +651,9 @@ goauth_authorize(const char *home, const char *cal_name,
 		memset(access, 0, sizeof(access));
 		memset(refresh, 0, sizeof(refresh));
 	}
+
+	if (kc_progress_verbose)
+		fprintf(stderr, "kc: authorized '%s'.\n", cal_name);
 
 	return 0;
 }

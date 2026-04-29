@@ -14,6 +14,8 @@
 #include "kc.h"
 #include "config.h"
 
+int kc_progress_verbose = 0;
+
 /* helper — not exposed in header */
 static void
 copy_str(char *dst, const char *src, size_t n)
@@ -581,22 +583,39 @@ vdir_fetch_subscription(const struct calendar *cal)
 int
 vdir_sync_all(const struct state *st)
 {
-	int i, ret = 0;
+	int i, rc, ret = 0;
+	const struct calendar *cal;
 
 	/* fetch all .ics subscriptions */
 	for (i = 0; i < st->n_calendars; i++) {
-		if (st->calendars[i].subscription && st->calendars[i].visible) {
-			if (vdir_fetch_subscription(&st->calendars[i]) != 0)
-				ret = -1;
+		cal = &st->calendars[i];
+		if (!cal->subscription || !cal->visible)
+			continue;
+		if (kc_progress_verbose) {
+			fprintf(stderr, "kc: fetching %s... ", cal->name);
+			fflush(stderr);
 		}
+		rc = vdir_fetch_subscription(cal);
+		if (kc_progress_verbose)
+			fprintf(stderr, "%s\n", rc == 0 ? "ok" : "failed");
+		if (rc != 0)
+			ret = -1;
 	}
 
 	/* sync CalDAV calendars using native libcurl */
 	for (i = 0; i < st->n_calendars; i++) {
-		if (st->calendars[i].caldav && st->calendars[i].visible) {
-			if (caldav_sync_calendar(&st->calendars[i]) != 0)
-				ret = -1;
+		cal = &st->calendars[i];
+		if (!cal->caldav || !cal->visible)
+			continue;
+		if (kc_progress_verbose) {
+			fprintf(stderr, "kc: syncing %s... ", cal->name);
+			fflush(stderr);
 		}
+		rc = caldav_sync_calendar(cal);
+		if (kc_progress_verbose)
+			fprintf(stderr, "%s\n", rc == 0 ? "ok" : "failed");
+		if (rc != 0)
+			ret = -1;
 	}
 
 	return ret;
