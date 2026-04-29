@@ -1,0 +1,27 @@
+# Build environment for the kc .deb. Mirrors what release.yml installs in
+# CI; useful for local builds:
+#
+#   docker build -f Dockerfile.build -t kc-build .
+#   docker run --rm -v "$PWD:/src" -w /src kc-build make deb
+#
+# Version is read from the VERSION file at the repo root.
+
+FROM debian:bullseye-slim
+# build against oldest still-supported glibc so the resulting .deb runs on
+# bullseye, bookworm, trixie, and ubuntu 22.04+. switch to bookworm when
+# bullseye hits EOL (~aug 2026).
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libical-dev \
+        libcurl4-openssl-dev \
+        libncurses-dev \
+        dpkg-dev \
+        fakeroot \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

@@ -2,3 +2,4 @@ kc
 *.o
 *.bak
 *.keys
+dist/

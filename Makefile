@@ -1,7 +1,9 @@
 # kc - kai calendar
 # See LICENSE file for copyright and license details.
 
-VERSION = 0.1.0
+# Version lives in the VERSION file (single source of truth).
+# To release: bump VERSION, commit, tag the same value with `v` prefix, push tag.
+VERSION := $(shell cat VERSION)
 
 PREFIX = /usr/local
 PKG_CONFIG = pkg-config
@@ -45,4 +47,27 @@ install: $(BIN)
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
-.PHONY: all clean install uninstall
+# --- debian package ---
+# `make deb` produces dist/kc_<version>_<arch>.deb. CI overrides DEB_VERSION
+# from the git tag (refs/tags/vX.Y.Z -> X.Y.Z); local builds default to the
+# VERSION file.
+DEB_VERSION ?= $(VERSION)
+DEB_ARCH    := $(shell dpkg --print-architecture 2>/dev/null)
+DEB_STAGE   := dist/deb-stage
+DEB_FILE    := dist/kc_$(DEB_VERSION)_$(DEB_ARCH).deb
+
+deb: debian/control.in
+	$(MAKE) clean
+	$(MAKE) PREFIX=/usr
+	rm -rf $(DEB_STAGE)
+	$(MAKE) install DESTDIR=$(DEB_STAGE) PREFIX=/usr
+	mkdir -p $(DEB_STAGE)/DEBIAN
+	sed -e 's|__VERSION__|$(DEB_VERSION)|g' \
+	    -e 's|__ARCH__|$(DEB_ARCH)|g' \
+	    debian/control.in > $(DEB_STAGE)/DEBIAN/control
+	mkdir -p dist
+	fakeroot dpkg-deb --build --root-owner-group $(DEB_STAGE) $(DEB_FILE)
+	@echo
+	@echo "  built $(DEB_FILE)"
+
+.PHONY: all clean install uninstall deb

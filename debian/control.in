@@ -1,0 +1,13 @@
+Package: kc
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: __ARCH__
+Maintainer: willgcr <hello@willgcr.me>
+Depends: libc6, libical3t64 | libical3, libcurl4t64 | libcurl4, libncursesw6
+Homepage: https://wrklabs.org/kc
+Description: terminal calendar with CalDAV and Google Calendar sync
+ kc is a minimal terminal calendar. Manages calendars locally in vdir
+ format, with two-way CalDAV sync (iCloud and others), Google Calendar
+ via OAuth2, ICS subscriptions, recurring events, and attendee RSVP —
+ all rendered in a fast ncurses TUI.

@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: build .deb (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: debian:bullseye-slim   # build against oldest still-supported glibc
+                                      # so binaries run on bullseye, bookworm,
+                                      # trixie, ubuntu 22.04+, etc.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest        # x86_64 native
+          - arch: arm64
+            runner: ubuntu-24.04-arm     # arm64 native (GitHub-hosted)
+    steps:
+      - name: install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libical-dev libcurl4-openssl-dev libncurses-dev \
+            dpkg-dev fakeroot ca-certificates git
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: verify tag matches VERSION
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          FILE_VER=$(cat VERSION)
+          if [ "$TAG_VER" != "$FILE_VER" ]; then
+            echo "ERROR: tag $TAG_VER does not match VERSION file $FILE_VER"
+            exit 1
+          fi
+          echo "tag and VERSION match: $TAG_VER"
+
+      - name: build .deb
+        run: make deb
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          retention-days: 1
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: download all .debs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
