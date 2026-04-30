@@ -214,7 +214,7 @@ goauth_load_client(const char *home, char *id, size_t idlen,
 	}
 
 	/* fall back to compiled-in defaults */
-	if (GOOGLE_CLIENT_ID[0] && GOOGLE_CLIENT_SECRET[0]) {
+	if (GOOGLE_CLIENT_ID[0] != '\0' && GOOGLE_CLIENT_SECRET[0] != '\0') {
 		strncpy(id, GOOGLE_CLIENT_ID, idlen - 1);
 		id[idlen - 1] = '\0';
 		strncpy(secret, GOOGLE_CLIENT_SECRET, secretlen - 1);

@@ -8,10 +8,17 @@ VERSION := $(shell cat VERSION)
 PREFIX = /usr/local
 PKG_CONFIG = pkg-config
 
-# detect OS for ncurses library name
+# detect OS for ncurses library name and macOS pkg-config paths
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 NCURSES = -lncurses
+CFLAGS += -D_DARWIN_C_SOURCE
+# Homebrew on Apple Silicon (and Intel) may install icu4c in a versioned keg
+# that is not on the default pkg-config search path.
+ICU4C_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
+ifneq ($(ICU4C_PREFIX),)
+export PKG_CONFIG_PATH := $(ICU4C_PREFIX)/lib/pkgconfig:$(PKG_CONFIG_PATH)
+endif
 else
 NCURSES = -lncursesw
 endif
