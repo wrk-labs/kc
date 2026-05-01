@@ -139,8 +139,10 @@ vdir_load_config(const char *home, struct state *st)
 				copy_str(cal->path, p + 5, MAX_PATH_LEN);
 				/* reject absolute paths and ".." to prevent traversal */
 				if (strstr(cal->path, "..") || cal->path[0] == '/') {
-					snprintf(cal->path, MAX_PATH_LEN,
-					         "%s/%s/calendars/%s", home, data_dir, cal->name);
+					char tmp[MAX_PATH_LEN];
+					snprintf(tmp, sizeof(tmp), "%s/%s/calendars/%s",
+					         home, data_dir, cal->name);
+					copy_str(cal->path, tmp, MAX_PATH_LEN);
 				}
 			} else if (strncmp(p, "color ", 6) == 0) {
 				int c = atoi(p + 6);
@@ -228,8 +230,15 @@ vdir_add_local_calendar(const char *home, struct state *st, const char *name)
 	memset(cal, 0, sizeof(*cal));
 	copy_str(cal->name, name, MAX_NAME_LEN);
 	sanitize_name(cal->name, MAX_NAME_LEN);
-	snprintf(cal->path, MAX_PATH_LEN,
-	         "%s/%s/calendars/%s", home, data_dir, cal->name);
+	{
+		/* stage in a local buffer first — gcc -Wrestrict can't prove
+		 * cal->name (an arg) doesn't alias cal->path (the destination),
+		 * since both reach through the same struct. */
+		char tmp[MAX_PATH_LEN];
+		snprintf(tmp, sizeof(tmp), "%s/%s/calendars/%s",
+		         home, data_dir, cal->name);
+		copy_str(cal->path, tmp, MAX_PATH_LEN);
+	}
 	mkdir(cal->path, 0755);
 	cal->color = cal_colors[st->n_calendars % 8];
 	cal->visible = 1;
@@ -253,8 +262,15 @@ vdir_add_caldav_calendar(const char *home, struct state *st,
 	memset(cal, 0, sizeof(*cal));
 	copy_str(cal->name, name, MAX_NAME_LEN);
 	sanitize_name(cal->name, MAX_NAME_LEN);
-	snprintf(cal->path, MAX_PATH_LEN,
-	         "%s/%s/calendars/%s", home, data_dir, cal->name);
+	{
+		/* stage in a local buffer first — gcc -Wrestrict can't prove
+		 * cal->name (an arg) doesn't alias cal->path (the destination),
+		 * since both reach through the same struct. */
+		char tmp[MAX_PATH_LEN];
+		snprintf(tmp, sizeof(tmp), "%s/%s/calendars/%s",
+		         home, data_dir, cal->name);
+		copy_str(cal->path, tmp, MAX_PATH_LEN);
+	}
 	mkdir(cal->path, 0755);
 	cal->color = cal_colors[st->n_calendars % 8];
 	cal->visible = 1;
@@ -285,8 +301,15 @@ vdir_add_oauth_calendar(const char *home, struct state *st,
 	memset(cal, 0, sizeof(*cal));
 	copy_str(cal->name, name, MAX_NAME_LEN);
 	sanitize_name(cal->name, MAX_NAME_LEN);
-	snprintf(cal->path, MAX_PATH_LEN,
-	         "%s/%s/calendars/%s", home, data_dir, cal->name);
+	{
+		/* stage in a local buffer first — gcc -Wrestrict can't prove
+		 * cal->name (an arg) doesn't alias cal->path (the destination),
+		 * since both reach through the same struct. */
+		char tmp[MAX_PATH_LEN];
+		snprintf(tmp, sizeof(tmp), "%s/%s/calendars/%s",
+		         home, data_dir, cal->name);
+		copy_str(cal->path, tmp, MAX_PATH_LEN);
+	}
 	mkdir(cal->path, 0755);
 	cal->color = cal_colors[st->n_calendars % 8];
 	cal->visible = 1;
@@ -502,8 +525,15 @@ vdir_add_subscription(const char *home, struct state *st,
 	memset(cal, 0, sizeof(*cal));
 	copy_str(cal->name, name, MAX_NAME_LEN);
 	sanitize_name(cal->name, MAX_NAME_LEN);
-	snprintf(cal->path, MAX_PATH_LEN,
-	         "%s/%s/calendars/%s", home, data_dir, cal->name);
+	{
+		/* stage in a local buffer first — gcc -Wrestrict can't prove
+		 * cal->name (an arg) doesn't alias cal->path (the destination),
+		 * since both reach through the same struct. */
+		char tmp[MAX_PATH_LEN];
+		snprintf(tmp, sizeof(tmp), "%s/%s/calendars/%s",
+		         home, data_dir, cal->name);
+		copy_str(cal->path, tmp, MAX_PATH_LEN);
+	}
 	mkdir(cal->path, 0755);
 	cal->color = cal_colors[st->n_calendars % 8];
 	cal->visible = 1;
