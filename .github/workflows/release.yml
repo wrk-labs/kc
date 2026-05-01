@@ -6,12 +6,29 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  verify:
+    name: verify tag matches VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: check
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          FILE_VER=$(cat VERSION)
+          if [ "$TAG_VER" != "$FILE_VER" ]; then
+            echo "ERROR: tag $TAG_VER does not match VERSION file $FILE_VER"
+            exit 1
+          fi
+          echo "tag and VERSION match: $TAG_VER"
+
+  linux-build:
     name: build .deb (${{ matrix.arch }})
+    needs: verify
     runs-on: ${{ matrix.runner }}
-    container: debian:bullseye-slim   # build against oldest still-supported glibc
-                                      # so binaries run on bullseye, bookworm,
-                                      # trixie, ubuntu 22.04+, etc.
+    container: debian:bullseye-slim   # oldest still-supported glibc → runs on
+                                      # bullseye/bookworm/trixie/Ubuntu 22.04+
     strategy:
       fail-fast: false
       matrix:
@@ -34,16 +51,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: verify tag matches VERSION
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#v}"
-          FILE_VER=$(cat VERSION)
-          if [ "$TAG_VER" != "$FILE_VER" ]; then
-            echo "ERROR: tag $TAG_VER does not match VERSION file $FILE_VER"
-            exit 1
-          fi
-          echo "tag and VERSION match: $TAG_VER"
-
       - name: build .deb
         run: make deb
 
@@ -54,22 +61,72 @@ jobs:
           path: dist/*.deb
           retention-days: 1
 
+  macos-build:
+    name: build darwin tarball (${{ matrix.arch }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14            # Apple Silicon
+          - arch: x86_64
+            runner: macos-13            # Intel
+    steps:
+      - name: install build deps
+        # libical for calendar parsing; ncurses for the TUI (Homebrew 6.x,
+        # not Apple's frozen 5.x). The Makefile prefers Homebrew ncurses
+        # when present and falls back to system otherwise.
+        run: brew install libical ncurses
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: build
+        # Floor of macOS 12 — covers anything actively maintained, and the
+        # SDK happily lets us reference only pre-12 symbols (kc has none
+        # newer). Build host's macOS version is irrelevant to the floor.
+        run: make
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+      - name: package tarball
+        # Flat tarball (kc + LICENSE at root). Brew's def install runs from
+        # the extraction directory and does `bin.install "kc"` directly.
+        run: |
+          VER=$(cat VERSION)
+          ARCH=${{ matrix.arch }}
+          mkdir -p dist
+          tar -czf "dist/kc-${VER}-darwin-${ARCH}.tar.gz" kc LICENSE
+          ls -la dist/
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          retention-days: 1
+
   release:
     name: publish github release
-    needs: build
+    needs: [linux-build, macos-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: download all .debs
+      - name: download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: deb-*
           path: dist
           merge-multiple: true
 
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.deb
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
           generate_release_notes: true

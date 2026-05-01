@@ -11,13 +11,22 @@ PKG_CONFIG = pkg-config
 # detect OS for ncurses library name and macOS pkg-config paths
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-NCURSES = -lncurses
 CFLAGS += -D_DARWIN_C_SOURCE
 # Homebrew on Apple Silicon (and Intel) may install icu4c in a versioned keg
 # that is not on the default pkg-config search path.
 ICU4C_PREFIX := $(shell brew --prefix icu4c 2>/dev/null)
 ifneq ($(ICU4C_PREFIX),)
 export PKG_CONFIG_PATH := $(ICU4C_PREFIX)/lib/pkgconfig:$(PKG_CONFIG_PATH)
+endif
+# Prefer Homebrew ncurses (6.x, actively patched, wide-char + mouse v2)
+# over Apple's system ncurses (stuck at 5.x ~2006). Falls back to system
+# if Homebrew ncurses isn't installed.
+HOMEBREW_NCURSES := $(shell brew --prefix ncurses 2>/dev/null)
+ifneq ($(HOMEBREW_NCURSES),)
+  CFLAGS += -I$(HOMEBREW_NCURSES)/include
+  NCURSES = -L$(HOMEBREW_NCURSES)/lib -lncursesw
+else
+  NCURSES = -lncurses
 endif
 else
 NCURSES = -lncursesw
