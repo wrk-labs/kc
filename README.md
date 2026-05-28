@@ -2,7 +2,7 @@
 
 A minimal terminal calendar for [kai](https://github.com/wrk-labs/kai) Linux. Built with C and ncurses.
 
-kc manages calendars locally using the vdir format, with support for CalDAV sync and ICS subscriptions. No Electron, no web views — just a fast TUI.
+kc manages calendars locally using the vdir format, with support for CalDAV sync and ICS subscriptions.
 
 ## Features
 
@@ -37,11 +37,6 @@ kc -v           # print version
 ## Configuration
 
 Config lives in `~/.kc/config`. Calendars can be managed interactively by pressing `c` inside kc.
-
-## Known Issues / Future Work
-
-- Deleting a single occurrence of a recurring event on Google Calendar causes duplication in kc after sync
-- No support for adding or removing attendees from events
 
 ## License
 

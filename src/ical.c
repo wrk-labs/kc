@@ -10,6 +10,46 @@
 
 #include "kc.h"
 
+/*
+ * libical changed icalrecurrencetype from a value type (v3) to a
+ * refcounted heap object (v4). These macros normalize call sites so the
+ * body of this file always treats it as a pointer.
+ *
+ *   RRULE_FROM_PROP(prop, ptr, storage)
+ *     Read the RRULE from a property into `ptr`. In v3 the value is
+ *     copied into `storage` (a struct icalrecurrencetype lvalue the
+ *     caller declares) and `ptr` is set to its address. In v4 `ptr`
+ *     receives the borrowed pointer from libical (do not free).
+ *
+ *   RRULE_ALLOC_BLOCK(name, storage_name)
+ *     Declare and initialize a fresh icalrecurrencetype pointer named
+ *     `name`. Pair with RRULE_RELEASE(name).
+ *
+ *   RRULE_PROP_NEW(ptr)   — wrap icalproperty_new_rrule on a pointer.
+ *   RRULE_ITER_NEW(ptr,t) — wrap icalrecur_iterator_new on a pointer.
+ *   RRULE_RELEASE(ptr)    — drop our ref in v4, no-op in v3.
+ */
+#if ICAL_MAJOR_VERSION >= 4
+#  define RRULE_FROM_PROP(prop, ptr, storage)  \
+	do { (void)(storage); (ptr) = icalproperty_get_rrule(prop); } while (0)
+#  define RRULE_ALLOC_BLOCK(name, storage_name) \
+	struct icalrecurrencetype *name = icalrecurrencetype_new()
+#  define RRULE_PROP_NEW(ptr)         icalproperty_new_rrule(ptr)
+#  define RRULE_ITER_NEW(ptr, t)      icalrecur_iterator_new((ptr), (t))
+#  define RRULE_RELEASE(ptr) \
+	do { if (ptr) icalrecurrencetype_unref(ptr); } while (0)
+#else
+#  define RRULE_FROM_PROP(prop, ptr, storage)  \
+	do { (storage) = icalproperty_get_rrule(prop); (ptr) = &(storage); } while (0)
+#  define RRULE_ALLOC_BLOCK(name, storage_name) \
+	struct icalrecurrencetype storage_name; \
+	icalrecurrencetype_clear(&storage_name); \
+	struct icalrecurrencetype *name = &storage_name
+#  define RRULE_PROP_NEW(ptr)         icalproperty_new_rrule(*(ptr))
+#  define RRULE_ITER_NEW(ptr, t)      icalrecur_iterator_new(*(ptr), (t))
+#  define RRULE_RELEASE(ptr)          ((void)(ptr))
+#endif
+
 static void
 copy_truncate(char *dst, const char *src, size_t n)
 {
@@ -261,13 +301,17 @@ parse_vevent(icalcomponent *vevent, const char *path, int cal_idx,
 	/* recurrence (RRULE) */
 	prop = icalcomponent_get_first_property(vevent, ICAL_RRULE_PROPERTY);
 	if (prop) {
-		struct icalrecurrencetype rrule = icalproperty_get_rrule(prop);
-		ev->recur_freq = ical_to_recur_freq(rrule.freq);
-		ev->recur_interval = rrule.interval > 0 ? rrule.interval : 1;
-		ev->recur_count = rrule.count;
-		if (!icaltime_is_null_time(rrule.until))
-			ev->recur_until = icaltime_as_timet_with_zone(
-				rrule.until, icaltimezone_get_utc_timezone());
+		struct icalrecurrencetype rrule_storage;
+		struct icalrecurrencetype *rrule = NULL;
+		RRULE_FROM_PROP(prop, rrule, rrule_storage);
+		if (rrule) {
+			ev->recur_freq = ical_to_recur_freq(rrule->freq);
+			ev->recur_interval = rrule->interval > 0 ? rrule->interval : 1;
+			ev->recur_count = rrule->count;
+			if (!icaltime_is_null_time(rrule->until))
+				ev->recur_until = icaltime_as_timet_with_zone(
+					rrule->until, icaltimezone_get_utc_timezone());
+		}
 	}
 
 	/* organizer + attendees */
@@ -368,7 +412,8 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 			if (events[count].recur_freq != RECUR_NONE) {
 				struct event base = events[count];
 				icalproperty *rrule_prop, *exd_prop;
-				struct icalrecurrencetype rrule;
+				struct icalrecurrencetype rrule_storage;
+				struct icalrecurrencetype *rrule = NULL;
 				icalrecur_iterator *ritr;
 				struct icaltimetype dtstart, next;
 				time_t duration = base.end - base.start;
@@ -421,9 +466,13 @@ ical_load_file(const char *path, int cal_idx, struct event *events,
 					continue;
 				}
 
-				rrule = icalproperty_get_rrule(rrule_prop);
+				RRULE_FROM_PROP(rrule_prop, rrule, rrule_storage);
+				if (!rrule) {
+					count++;
+					continue;
+				}
 				dtstart = icalcomponent_get_dtstart(vevent);
-				ritr = icalrecur_iterator_new(rrule, dtstart);
+				ritr = RRULE_ITER_NEW(rrule, dtstart);
 				if (!ritr) {
 					count++;
 					continue;
@@ -971,16 +1020,16 @@ ical_save_event(const struct event *ev)
 		/* recurrence */
 		remove_props(vevent, ICAL_RRULE_PROPERTY);
 		if (ev->recur_freq != RECUR_NONE) {
-			struct icalrecurrencetype rrule;
-			icalrecurrencetype_clear(&rrule);
-			rrule.freq = recur_freq_to_ical(ev->recur_freq);
-			rrule.interval = ev->recur_interval > 0 ? ev->recur_interval : 1;
+			RRULE_ALLOC_BLOCK(rrule, rrule_storage);
+			rrule->freq = recur_freq_to_ical(ev->recur_freq);
+			rrule->interval = ev->recur_interval > 0 ? ev->recur_interval : 1;
 			if (ev->recur_count > 0)
-				rrule.count = ev->recur_count;
+				rrule->count = ev->recur_count;
 			if (ev->recur_until > 0)
-				rrule.until = icaltime_from_timet_with_zone(
+				rrule->until = icaltime_from_timet_with_zone(
 					ev->recur_until, 0, icaltimezone_get_utc_timezone());
-			icalcomponent_add_property(vevent, icalproperty_new_rrule(rrule));
+			icalcomponent_add_property(vevent, RRULE_PROP_NEW(rrule));
+			RRULE_RELEASE(rrule);
 		}
 
 		/* update timestamps and sequence */
@@ -1012,16 +1061,16 @@ ical_save_event(const struct event *ev)
 				icalproperty_new_status(event_status_to_ical(ev->status)));
 
 		if (ev->recur_freq != RECUR_NONE) {
-			struct icalrecurrencetype rrule;
-			icalrecurrencetype_clear(&rrule);
-			rrule.freq = recur_freq_to_ical(ev->recur_freq);
-			rrule.interval = ev->recur_interval > 0 ? ev->recur_interval : 1;
+			RRULE_ALLOC_BLOCK(rrule, rrule_storage);
+			rrule->freq = recur_freq_to_ical(ev->recur_freq);
+			rrule->interval = ev->recur_interval > 0 ? ev->recur_interval : 1;
 			if (ev->recur_count > 0)
-				rrule.count = ev->recur_count;
+				rrule->count = ev->recur_count;
 			if (ev->recur_until > 0)
-				rrule.until = icaltime_from_timet_with_zone(
+				rrule->until = icaltime_from_timet_with_zone(
 					ev->recur_until, 0, icaltimezone_get_utc_timezone());
-			icalcomponent_add_property(vevent, icalproperty_new_rrule(rrule));
+			icalcomponent_add_property(vevent, RRULE_PROP_NEW(rrule));
+			RRULE_RELEASE(rrule);
 		}
 
 		update_timestamps(vevent);
